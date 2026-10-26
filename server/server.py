@@ -398,6 +398,9 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/", "/index.html"):
             self._send(HTTPStatus.OK, DASHBOARD.encode("utf-8"), "text/html")
             return
+        if path == "/admin":
+            self._send(HTTPStatus.OK, ADMIN_PAGE.encode("utf-8"), "text/html")
+            return
         if path == "/health":
             self._send(
                 HTTPStatus.OK,
@@ -520,6 +523,123 @@ class Handler(BaseHTTPRequestHandler):
         self._send(HTTPStatus.NOT_FOUND, {"error": "未知接口"})
 
 
+ADMIN_PAGE = """<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+<title>pwdash 审核</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{color-scheme:dark}
+body{background:#0f1115;color:#e6e6e6;font:15px/1.6 system-ui,sans-serif;margin:0;padding:16px 14px 40px}
+h1{font-size:18px;margin:0 0 4px}
+p.hint{color:#93a1b5;font-size:13px;margin:4px 0 14px}
+.wrap{max-width:720px;margin:0 auto}
+.card{background:#181c24;border:1px solid #242b36;border-radius:12px;padding:14px;margin:0 0 10px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:#93a1b5;word-break:break-all}
+.pwd{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:14px;color:#e6e6e6;word-break:break-all;margin:6px 0}
+button{font:inherit;padding:7px 14px;border-radius:8px;border:1px solid #2c3542;background:#11161d;color:#e6e6e6;cursor:pointer}
+button.ok{background:#14361f;border-color:#2f6b40;color:#7fe0a0}
+button.no{background:#3a1717;border-color:#6b2f2f;color:#ffb3b3}
+button.ghost{background:transparent}
+button:active{transform:translateY(1px)}
+.empty{color:#64748b;font-size:14px}
+.top{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px}
+</style>
+<div class="wrap">
+  <div class="top"><h1>&#128221; 投稿审核</h1><button class="ghost" id="reload">刷新</button></div>
+  <p class="hint" id="hint">正在读取待审队列…</p>
+  <div id="list"></div>
+  <div class="row" id="bulk" hidden>
+    <button class="ok" id="approve-all">全部通过</button>
+    <button class="no" id="reject-all">全部拒绝</button>
+  </div>
+</div>
+<script>
+(function () {
+  var qs = new URLSearchParams(location.search);
+  var token = qs.get('token') || '';
+  if (token) { try { localStorage.setItem('pwdash.admin.token', token); } catch (e) {} history.replaceState(null, '', location.pathname); }
+  if (!token) { try { token = localStorage.getItem('pwdash.admin.token') || ''; } catch (e) {} }
+  var hint = document.getElementById('hint');
+  var list = document.getElementById('list');
+  var bulk = document.getElementById('bulk');
+  if (!token) { hint.textContent = '缺少 token：请打开 /admin?token=你的口令'; return; }
+  function api(path, body) {
+    return fetch(path, {
+      method: body ? 'POST' : 'GET',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+      body: body ? JSON.stringify(body) : undefined,
+      credentials: 'omit'
+    }).then(function (r) { return r.json().then(function (d) { return { status: r.status, data: d }; }); });
+  }
+  function row(item) {
+    var card = document.createElement('div');
+    card.className = 'card';
+    var md5 = document.createElement('div');
+    md5.className = 'mono';
+    md5.textContent = item.md5 + (item.db ? ' · 进 ' + item.db : '');
+    var pwd = document.createElement('div');
+    pwd.className = 'pwd';
+    pwd.textContent = '••••••';
+    var bar = document.createElement('div');
+    bar.className = 'row';
+    var show = document.createElement('button');
+    show.className = 'ghost';
+    show.textContent = '显示';
+    show.onclick = function () {
+      var hidden = pwd.textContent === '••••••';
+      pwd.textContent = hidden ? item.password : '••••••';
+      show.textContent = hidden ? '隐藏' : '显示';
+    };
+    var ok = document.createElement('button');
+    ok.className = 'ok';
+    ok.textContent = '通过';
+    ok.onclick = function () { decide('approve', item.md5); };
+    var no = document.createElement('button');
+    no.className = 'no';
+    no.textContent = '拒绝';
+    no.onclick = function () { decide('reject', item.md5); };
+    bar.append(show, ok, no);
+    card.append(md5, pwd, bar);
+    return card;
+  }
+  function render(data) {
+    var items = (data && data.detail) || [];
+    list.replaceChildren();
+    if (!items.length) {
+      var p = document.createElement('p');
+      p.className = 'empty';
+      p.textContent = '没有待审投稿';
+      list.append(p);
+      bulk.hidden = true;
+      hint.textContent = '待审 0 条';
+      return;
+    }
+    items.forEach(function (it) { list.append(row(it)); });
+    bulk.hidden = false;
+    hint.textContent = '待审 ' + items.length + ' 条（通过后写入对应库）';
+  }
+  function load() {
+    hint.textContent = '正在读取待审队列…';
+    api('/contrib/pending').then(function (r) {
+      if (r.status === 401) { hint.textContent = 'token 不对（401），请重新打开 /admin?token=…'; return; }
+      if (r.status !== 200) { hint.textContent = '读取失败：HTTP ' + r.status; return; }
+      render(r.data);
+    }).catch(function (e) { hint.textContent = '连不上服务：' + e.message; });
+  }
+  function decide(kind, md5) {
+    api('/contrib/' + kind, md5 ? { ids: [md5] } : { all: true }).then(function (r) {
+      if (r.status !== 200) { hint.textContent = '操作失败：' + (r.data && r.data.error ? r.data.error : 'HTTP ' + r.status); return; }
+      load();
+    }).catch(function (e) { hint.textContent = '连不上服务：' + e.message; });
+  }
+  document.getElementById('reload').onclick = load;
+  document.getElementById('approve-all').onclick = function () { decide('approve', ''); };
+  document.getElementById('reject-all').onclick = function () { decide('reject', ''); };
+  load();
+})();
+</script></html>"""
+
+
 DASHBOARD = """<!doctype html><html lang="zh-CN"><meta charset="utf-8">
 <title>pwdash 服务</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -528,7 +648,8 @@ place-items:center;min-height:100vh;margin:0}main{background:#181c24;padding:32p
 max-width:520px}a{color:#4caf50}code{background:#0d1014;padding:2px 6px;border-radius:5px}</style>
 <main><h1>🔑 pwdash</h1><p>服务运行中。可用接口：</p>
 <ul><li><code>GET /health</code></li><li><code>GET /query/&lt;md5&gt;</code></li>
-<li><code>POST /upload</code>（需 token）</li><li><code>GET /db</code>（需 token）</li></ul>
+<li><code>POST /upload</code>（需 token）</li><li><code>GET /db</code>（需 token）</li>
+<li><code>GET /admin?token=&lt;你的口令&gt;</code> 审核待审投稿</li></ul>
 <p>网页版查询界面见仓库根目录的 <code>index.html</code>。</p></main></html>"""
 
 

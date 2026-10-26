@@ -344,10 +344,7 @@
     const cached = lsSet(LS.db, merged) && lsSet(LS.meta, state.meta);
     if (!cached) toast('密码库已加载，但本地缓存失败（存储空间不足）', 'err');
     renderMeta();
-    const okLibs = perSource.filter((p) => !p.error);
-    const repo = (okLibs[0] && okLibs[0].name) || REPO_NAME;
-    const libText = okLibs.length > 1 ? `${okLibs.length} 个库合并（${repo}）` : repo;
-    pushLog('db', `密码库已更新：${Object.keys(merged).length} 条（${libText}）`, true);
+    // 自动刷新只是一次后台加载，不写操作记录（记录只留给用户主动动作）
     return state.db;
   }
 
@@ -1228,7 +1225,9 @@
       toast('正在刷新密码库…');
       try {
         await refreshDb({ force: true });
-        toast(`已刷新，共 ${Object.keys(state.db || {}).length} 条`);
+        const n = Object.keys(state.db || {}).length;
+        pushLog('db', `手动刷新密码库：${n} 条`, true);
+        toast(`已刷新，共 ${n} 条`);
       } catch (err) {
         toast('刷新失败：' + ((err && err.message) || err), 'err');
       }

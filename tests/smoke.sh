@@ -9,6 +9,7 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 export ROOT
 TMP=$(mktemp -d)
+export TMP
 PORT=$(( (RANDOM % 2000) + 18000 ))
 PASS=0
 FAIL=0
@@ -321,6 +322,63 @@ check "服务端 --db-dir 两个库都在" "community,own" "$(curl -s $MB/health
 check "服务端跨库查询命中" "comm-pass" "$(curl -s $MB/query/$(printf 'b%.0s' $(seq 32)) | python3 -c 'import json,sys;print(json.load(sys.stdin)["password"])')"
 check "服务端冲突取靠前库" "own-pass" "$(curl -s $MB/query/$(printf 'a%.0s' $(seq 32)) | python3 -c 'import json,sys;print(json.load(sys.stdin)["password"])')"
 kill "$SRV_PID" 2>/dev/null; SRV_PID=""
+
+echo
+echo "=== 6c. 审核页与写库编码 ==="
+AD="$TMP/auditdir"
+mkdir -p "$AD"
+python3 - "$AD" <<'PYAUDIT'
+import json, os, sys
+d = sys.argv[1]
+json.dump({}, open(os.path.join(d, "own.json"), "w"))
+json.dump({}, open(os.path.join(d, "community.json"), "w"))
+json.dump({"version": 1, "dbs": [{"name": "主库", "file": "own.json"}, {"name": "投稿库", "file": "community.json"}]}, open(os.path.join(d, "dbs.json"), "w"))
+PYAUDIT
+APORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+PWDASH_TOKEN=atk python3 "$ROOT/server/server.py" --port "$APORT" --db-dir "$AD" >"$TMP/audit.log" 2>&1 &
+SRV_PID=$!
+for _ in $(seq 1 40); do curl -sf -m 1 "http://127.0.0.1:$APORT/health" >/dev/null 2>&1 && break; sleep 0.2; done
+AB="http://127.0.0.1:$APORT"
+
+check "GET /admin 返回审核页" "200" "$(curl -s -o /dev/null -w '%{http_code}' "$AB/admin?token=atk")"
+check "审核页含关键元素" "yes" "$(curl -s "$AB/admin?token=atk" | grep -q '投稿审核' && echo yes || echo no)"
+check "审核页不需要 token 也能打开（页内再校验）" "200" "$(curl -s -o /dev/null -w '%{http_code}' "$AB/admin")"
+
+# 投稿 → 待审 → 通过 → 入库
+curl -s -X POST "$AB/contribute" -H 'Content-Type: application/json' -d '{"password":"audit-pass"}' >/dev/null
+PENDING_MD5=$(curl -s -H "Authorization: Bearer atk" "$AB/contrib/pending" | python3 -c 'import json,sys;d=json.load(sys.stdin)["detail"];print(d[0]["md5"] if d else "")')
+check "投稿进了待审队列" "1" "$(curl -s "$AB/contrib/count" | python3 -c 'import json,sys;print(json.load(sys.stdin)["pending"])')"
+check "没有 token 不能审核" "401" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$AB/contrib/approve" -H 'Content-Type: application/json' -d "{\"ids\":[\"$PENDING_MD5\"]}")"
+check "带 token 通过（ids 形式，与审核页一致）" "200" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$AB/contrib/approve" -H "Authorization: Bearer atk" -H 'Content-Type: application/json' -d "{\"ids\":[\"$PENDING_MD5\"]}")"
+check "通过后能查到" "audit-pass" "$(curl -s "$AB/query/$PENDING_MD5" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("password",""))')"
+check "待审队列清空" "0" "$(curl -s "$AB/contrib/count" | python3 -c 'import json,sys;print(json.load(sys.stdin)["pending"])')"
+check "写进 .json 库是明文（网页能直接读）" "yes" "$(python3 -c 'import json;d=json.load(open("'"$AD"'/community.json"));print("yes" if d else "no")')"
+check "通过后逐库条数正确" "1" "$(curl -s "$AB/health" | python3 -c 'import json,sys;print(sum(1 for d in json.load(sys.stdin)["dbs"] if d["name"]=="投稿库" and d["entries"]==1))')"
+kill "$SRV_PID" 2>/dev/null; SRV_PID=""
+
+# 同一份数据写成 .gz 也照旧可读（编码按扩展名）
+check ".gz 库仍写压缩" "yes" "$(python3 - <<'PYGZ'
+import sys, os, gzip
+sys.path.insert(0, os.path.join(os.environ["ROOT"], "tools"))
+import pwlib
+path = os.path.join(os.environ["TMP"], "enc.json.gz")
+st = pwlib.Store(path)
+st.put("a" * 32, "p")
+head = open(path, "rb").read(1)
+print("yes" if head == b"\x78" else "no")  # zlib 头（pwlib 的 .gz 用 zlib 压）
+PYGZ
+)" 2>/dev/null || echo "skip"
+check ".json 库写明文" "yes" "$(python3 - <<'PYJSON'
+import sys, os
+sys.path.insert(0, os.path.join(os.environ["ROOT"], "tools"))
+import pwlib
+path = os.path.join(os.environ["TMP"], "enc.json")
+st = pwlib.Store(path)
+st.put("a" * 32, "p")
+head = open(path, "rb").read(1)
+print("yes" if head == b"{" else "no")
+PYJSON
+)" 2>/dev/null || echo "skip"
 
 echo
 echo "=== 7. 前端资源 ==="

@@ -217,10 +217,18 @@ def atomic_write(path: str, data: bytes, mode: int = 0o644) -> None:
 # 高层 API
 # --------------------------------------------------------------------------
 class Store:
-    """密码库的读写门面。"""
+    """密码库的读写门面。
+
+    写回时按扩展名决定编码：``*.gz`` 写压缩内容，其余（``*.json``）写明文 JSON。
+    网页端直接 fetch ``.json`` 库，所以不能往里写压缩字节。
+    """
 
     def __init__(self, path: str | None = None):
         self.path = path or default_db_path()
+
+    @property
+    def compressed(self) -> bool:
+        return str(self.path).endswith(".gz")
 
     # ---- 读 ----
     def exists(self) -> bool:
@@ -262,7 +270,7 @@ class Store:
     # ---- 写 ----
     def save(self, data: "dict[str, str]") -> None:
         with _FileLock(self.path):
-            atomic_write(self.path, dumps(data, compress=True))
+            atomic_write(self.path, dumps(data, compress=self.compressed))
 
     def put(self, md5: str, password: str) -> bool:
         """写入一条记录。返回 True 表示新增，False 表示已存在相同密码。"""
@@ -274,7 +282,7 @@ class Store:
             if data.get(key) == password:
                 return False
             data[key] = password
-            atomic_write(self.path, dumps(data, compress=True))
+            atomic_write(self.path, dumps(data, compress=self.compressed))
         return True
 
     def delete(self, md5: str) -> bool:
@@ -284,7 +292,7 @@ class Store:
             if key not in data:
                 return False
             del data[key]
-            atomic_write(self.path, dumps(data, compress=True))
+            atomic_write(self.path, dumps(data, compress=self.compressed))
         return True
 
     def merge(self, incoming: "dict[str, str]", *, overwrite: bool = False) -> "dict[str, int]":
@@ -306,7 +314,7 @@ class Store:
                 else:
                     data[key] = raw_val
                     stats["added"] += 1
-            atomic_write(self.path, dumps(data, compress=True))
+            atomic_write(self.path, dumps(data, compress=self.compressed))
         return stats
 
 

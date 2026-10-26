@@ -376,11 +376,24 @@ PWDASH_TOKEN=$(openssl rand -hex 16) python3 server/server.py --bind 0.0.0.0 --p
 ./pwdash --server https://你的域名 contribute '解压密码'
 ./pwdash --server https://你的域名 contribute --md5 <32位md5> '解压密码'
 
-# 3. 你审核（在有 token 的机器上）
+# 3. 你审核 —— 两种方式，任选
+#    a) 网页：浏览器/手机打开，点「通过 / 拒绝」
+#       http://127.0.0.1:5000/admin?token=$PWDASH_TOKEN
+#    b) 命令行：
 ./pwdash --server https://你的域名 --token $PWDASH_TOKEN review --list
 ./pwdash --server https://你的域名 --token $PWDASH_TOKEN review --approve all
 ./pwdash --server https://你的域名 --token $PWDASH_TOKEN review --reject <md5>
 ```
+
+**审核页 `/admin`**（自建服务端自带，Worker 也有同样的页面）：
+
+- 地址带一次 token 就够：`/admin?token=你的口令`，页面会把 token 存进本机 localStorage，
+  并从地址栏抹掉；之后再打开 `/admin` 不用再带 token；
+- 列表里每条显示 MD5 + 目标库，密码默认打码，点「显示」才看明文；
+- 「通过」把记录写进它投稿时指定的库（默认投稿库 `community`），「拒绝」直接丢弃；
+- 支持「全部通过 / 全部拒绝」；token 不对会提示 401 而不是白屏。
+
+审核通过后，网页端下次刷新就会读到新记录（`dbs.json` 清单里的投稿库）。
 
 投稿三种模式用 `--contrib-mode` 切换（也可用环境变量 `PWDASH_CONTRIB_MODE`）：
 
