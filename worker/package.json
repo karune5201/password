@@ -1,0 +1,16 @@
+{
+  "name": "pwdash-worker",
+  "version": "2.1.0",
+  "private": true,
+  "type": "module",
+  "description": "pwdash 的 Cloudflare Workers 后端（零运行时依赖）",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "test": "node ../tests/worker_test.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

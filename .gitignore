@@ -15,3 +15,7 @@ passwords_pretty.json
 .idea/
 .vscode/
 node_modules/
+worker/node_modules/
+dist/
+.wrangler/
+.dev.vars

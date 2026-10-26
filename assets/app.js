@@ -25,6 +25,10 @@
     server: 'pwdash.server.v2',
   };
 
+  // 部署 Cloudflare Worker 后把地址填在这里，前端首次打开就会自动用它
+  // 例：'https://pwdash.your-name.workers.dev'
+  const DEFAULT_SERVER_URL = '';
+
   const DEFAULT_SOURCES = [
     {
       name: 'GitHub · Karune-SHI-E/1111',
@@ -1142,7 +1146,11 @@
     // 数据源与服务端配置
     const savedSources = lsGet(LS.sources, null);
     state.sources = Array.isArray(savedSources) && savedSources.length ? savedSources : DEFAULT_SOURCES.slice();
-    state.server = lsGet(LS.server, { url: '', token: '' }) || { url: '', token: '' };
+    const savedServer = lsGet(LS.server, null);
+    state.server =
+      savedServer && (savedServer.url || savedServer.token)
+        ? savedServer
+        : { url: DEFAULT_SERVER_URL || '', token: '' };
     state.history = lsGet(LS.history, []) || [];
 
     bindEvents();

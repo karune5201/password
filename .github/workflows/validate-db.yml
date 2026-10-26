@@ -1,0 +1,57 @@
+name: 校验密码库
+
+# 只要有人改动了数据文件或构建脚本，就跑一遍校验
+on:
+  push:
+    paths:
+      - 'passwords_local.json'
+      - 'passwords_local.json.gz'
+      - 'tools/**'
+      - '.github/workflows/validate-db.yml'
+  pull_request:
+    paths:
+      - 'passwords_local.json'
+      - 'passwords_local.json.gz'
+      - 'tools/**'
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 数据体检（不通过则 CI 失败）
+        run: |
+          python3 tools/build_db.py --check
+          echo "---"
+          python3 cli/pwdkit.py stats
+
+      - name: 检查 JSON 与 gz 是否一致
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          sys.path.insert(0, 'tools')
+          import pwlib
+
+          plain = json.load(open('passwords_local.json', encoding='utf-8'))
+          packed = pwlib.loads(open('passwords_local.json.gz', 'rb').read())
+
+          if set(plain) != set(packed):
+              only_json = sorted(set(plain) - set(packed))[:5]
+              only_gz = sorted(set(packed) - set(plain))[:5]
+              print(f'❌ 两份库不一致')
+              print(f'   仅 JSON 有: {only_json}')
+              print(f'   仅 GZ 有:   {only_gz}')
+              print('   修复: python3 tools/build_db.py')
+              raise SystemExit(1)
+
+          print(f'✅ 两份库一致，共 {len(plain)} 条')
+          PY
+
+      - name: 跑 CLI 冒烟测试
+        run: bash tests/smoke.sh

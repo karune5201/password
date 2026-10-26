@@ -1,0 +1,30 @@
+# Cloudflare Worker 配置（wrangler）
+# 部署：cd worker && npx wrangler deploy
+# 密钥：npx wrangler secret put GH_TOKEN / ADMIN_TOKEN
+name = "pwdash"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+workers_dev = true
+
+# 仓库坐标（谁的项目就改谁）
+[vars]
+GH_OWNER = "Karune-SHI-E"
+GH_REPO = "1111"
+GH_BRANCH = "master"
+GH_PATH = "passwords_local.json"
+CONTRIB_MODE = "queue"        # queue | auto | off
+CONTRIB_LIMIT = "10"          # 每 IP 每小时投稿上限
+CONTRIB_MAX_PENDING = "500"   # 待审队列上限
+CORS_ORIGIN = "*"             # 生产建议改成你的 Pages 域名
+
+# KV 可选：
+#   · 绑定了 KV → 库与待审队列放 KV（快、省 GitHub API 配额），审核后回写仓库
+#   · 不绑定       → 纯 GitHub 模式：库直接读仓库文件，投稿变成 GitHub Issue
+# 创建：npx wrangler kv namespace create DB
+# 然后把输出的 id 填进来，并取消下面两行注释
+# [[kv_namespaces]]
+# binding = "DB"
+# id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+[observability]
+enabled = true

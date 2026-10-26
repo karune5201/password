@@ -1,0 +1,64 @@
+name: 部署 Worker 与 Pages
+
+# 需要两个仓库 Secret：
+#   CLOUDFLARE_API_TOKEN   —— 权限：Workers Scripts:Edit, Workers KV Storage:Edit, Pages:Edit
+#   CLOUDFLARE_ACCOUNT_ID  —— Cloudflare 后台右侧的 Account ID
+#
+# Worker 的运行期密钥（GH_TOKEN / ADMIN_TOKEN）用 wrangler secret 配置一次即可，
+# 不要写进仓库。
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - 'worker/**'
+      - 'index.html'
+      - 'assets/**'
+      - 'manifest.webmanifest'
+      - 'sw.js'
+      - 'passwords_local.json'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+jobs:
+  deploy-worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 语法检查 + 单元测试
+        run: |
+          node --check worker/src/index.js
+          node tests/worker_test.mjs
+
+      - name: 部署 Worker
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: worker
+          command: deploy
+
+  deploy-pages:
+    runs-on: ubuntu-latest
+    needs: deploy-worker
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 准备静态产物（只发前端，不发 python/worker 源码）
+        run: |
+          mkdir -p dist
+          cp index.html manifest.webmanifest sw.js passwords_local.json dist/
+          cp -r assets dist/
+          ls -la dist
+
+      - name: 发布到 Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy dist --project-name=pwdash

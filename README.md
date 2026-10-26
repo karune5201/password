@@ -17,7 +17,9 @@
   - [3. 自建服务端](#3-自建服务端)
 - [命令速查](#命令速查)
 - [数据格式与维护](#数据格式与维护)
-- [部署](#部署)
+- [让别人上传 MD5 和密码](#让别人上传-md5-和密码)
+- [全托管部署：GitHub + Cloudflare Workers & Pages](#全托管部署github--cloudflare-workers--pages)
+- [其它部署方式](#其它部署方式)
 - [安全与隐私](#安全与隐私)
 - [测试](#测试)
 - [从旧版迁移](#从旧版迁移)
@@ -50,7 +52,13 @@
 - 与服务端双向同步（`sync push` / `sync pull`）
 - 多解压后端自动降级，缺依赖时给出明确提示而**不会偷偷 pip install**
 
-**服务端（`server/server.py`，纯标准库）**
+**云后端（`worker/`，Cloudflare Workers，零运维）**
+
+- 数据放 GitHub、接口跑在 Workers、前端放 Pages —— 全流程不碰服务器
+- 两套存储自动切换：**KV 模式**（快，省 GitHub API 配额）或**纯 GitHub 模式**（投稿直接变成 Issue）
+- 自带手机可用的审核页 `/admin?token=…`，点两下就通过/拒绝
+
+**自建服务端（`server/server.py`，纯标准库，可选）**
 
 - `GET /query/<md5>`、`POST /upload`、`POST /bulk`、`GET /db`、`GET /stats`、`GET /health`
 - 公开投稿：`POST /contribute`、`GET /contrib/count`、`GET /contrib/pending`、`POST /contrib/approve|reject`
@@ -74,7 +82,14 @@ password/
 ├── cli/
 │   ├── pwdkit.py           # 命令行主程序
 │   └── archive.py          # 解压后端抽象（zip/7z/rar 自动降级）
-├── server/server.py        # 自建查询服务
+├── server/server.py        # 自建查询服务（可选，本机/VPS 用）
+├── worker/                 # Cloudflare Workers 后端（推荐，零运维）
+│   ├── src/index.js        #   单文件 Worker，KV / 纯 GitHub 双模式
+│   ├── wrangler.toml       #   部署配置
+│   └── package.json
+├── .github/workflows/
+│   ├── validate-db.yml     #   数据体检 + 冒烟测试（PR 门禁）
+│   └── deploy.yml          #   自动部署 Worker + Pages
 ├── tools/
 │   ├── pwlib.py            # 库读写层（原子写入 + 文件锁）
 │   ├── build_db.py         # 库构建/清洗（体检、去脏数据、生成 gz 与 JSON）
@@ -291,9 +306,157 @@ curl -X POST https://你的域名/bulk \
 
 ---
 
-## 部署
+## 全托管部署：GitHub + Cloudflare Workers & Pages
 
-**GitHub Pages**（当前用法）
+不买服务器、不开进程，三块拼起来就是完整产品：
+
+```
+┌─────────────────────┐   读公开库     ┌──────────────────────┐
+│ Cloudflare Pages    │ ─────────────► │ GitHub 仓库           │
+│  index.html + 资源   │                │ passwords_local.json │
+└─────────┬───────────┘                └──────────┬───────────┘
+          │ 库里查不到 / 投稿                      │ 审核通过后回写
+          ▼                                       │
+┌─────────────────────┐   读写 KV / Issue         │
+│ Cloudflare Worker   │ ──────────────────────────┘
+│  /query /contribute │
+└─────────────────────┘
+```
+
+- **GitHub**：唯一的数据源（`passwords_local.json`），公开、可追溯、能回滚
+- **Pages**：纯静态前端，全球 CDN，免费
+- **Workers**：查询兜底 + 投稿接收入口 + 审核 API，免费额度（10 万请求/天）足够
+
+### 步骤 1：让仓库有个可用的库
+
+仓库里已有 `passwords_local.json` 就直接跳到下一步。要重建：
+
+```bash
+python3 tools/build_db.py --check          # 先体检
+python3 tools/build_db.py                  # 清洗并重写 json + gz
+git add passwords_local.json passwords_local.json.gz && git commit -m 'chore: 更新库' && git push
+```
+
+### 步骤 2：部署 Worker
+
+```bash
+cd worker
+npx wrangler login                                     # 浏览器授权一次
+
+# （可选）建 KV：绑了更快，不绑就用纯 GitHub 模式
+npx wrangler kv namespace create DB
+# 把输出的 id 填进 wrangler.toml 的 [[kv_namespaces]] 并取消注释
+
+# 改 wrangler.toml 里的 GH_OWNER / GH_REPO / GH_BRANCH
+npx wrangler deploy
+# → https://pwdash.<你的账号>.workers.dev
+```
+
+### 步骤 3：配两个密钥
+
+`GH_TOKEN` 需要有 **Contents 写** + **Issues 读写** 权限：
+
+- 细粒度 PAT：Repository access 选该仓库，Permissions → Contents: Read and write，Issues: Read and write
+- 经典 PAT：勾 `repo`
+
+```bash
+cd worker
+npx wrangler secret put GH_TOKEN        # 粘贴 PAT
+npx wrangler secret put ADMIN_TOKEN     # 自己编一个长口令，审核时用
+```
+
+> 有 KV 时 `GH_TOKEN` 只在「审核通过后回写仓库」用；纯 GitHub 模式下投稿也要用它开 Issue。
+
+### 步骤 4：验证
+
+```bash
+BASE=https://pwdash.<你的账号>.workers.dev
+curl -s $BASE/health            # {"status":"ok","backend":"kv","gh_token":true}
+curl -s $BASE/query/<md5>       # 200 + 密码 / 404
+
+# 匿名投稿（不需要 token）
+curl -s -X POST $BASE/contribute -H 'Content-Type: application/json' \
+     -d '{"password":"某个解压密码"}'
+
+# 审核
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" $BASE/contrib/pending
+curl -s -X POST $BASE/contrib/approve -H "Authorization: Bearer $ADMIN_TOKEN" \
+     -H 'Content-Type: application/json' -d '{"all":true}'
+```
+
+审核通过后 Worker 会自动 commit 回仓库，Pages 上的公开库随之更新。
+
+手机上也行：浏览器打开 `https://pwdash.<你>.workers.dev/admin?token=<ADMIN_TOKEN>`，点「通过 / 拒绝」。
+
+### 步骤 5：部署 Pages 并把地址告诉前端
+
+方式一（连 Git，推荐）：Cloudflare Dashboard → Workers & Pages → Create → Pages → 连接仓库，
+构建命令留空，输出目录填 `/`（根目录）。
+
+方式二（命令行）：
+
+```bash
+npx wrangler pages deploy . --project-name=pwdash
+```
+
+然后把 Worker 地址填进前端，**只需改一处**：
+
+```js
+// assets/app.js 第 30 行附近
+const DEFAULT_SERVER_URL = 'https://pwdash.<你的账号>.workers.dev';
+```
+
+这样访客打开页面，库里查不到时会自动去问 Worker；「投稿」页签也直接可用，无需手动配置。
+
+### 步骤 6：用 GitHub Actions 自动化（可选）
+
+仓库已带两个工作流：
+
+| 文件 | 触发 | 作用 |
+| --- | --- | --- |
+| `.github/workflows/validate-db.yml` | 改动数据/工具、PR | 数据体检 + JSON 与 gz 一致性校验 + 跑冒烟测试，不通过就拦住 PR |
+| `.github/workflows/deploy.yml` | 推送前端/Worker 相关改动 | 跑单元测试 → 部署 Worker → 发布 Pages |
+
+启用 `deploy.yml` 需要在仓库 Secrets 里加：
+
+- `CLOUDFLARE_API_TOKEN`：权限 Workers Scripts:Edit、Workers KV Storage:Edit、Pages:Edit
+- `CLOUDFLARE_ACCOUNT_ID`：Cloudflare 后台右侧的 Account ID
+
+### 两种 Worker 存储怎么选
+
+| | KV 模式（推荐） | 纯 GitHub 模式 |
+| --- | --- | --- |
+| 绑定 `DB` KV | 需要 | 不需要 |
+| 读库 | 读 KV，快且不吃 GitHub 配额 | 每次读 raw.githubusercontent（有 CDN 缓存） |
+| 投稿落到哪 | KV 待审队列 | **自动开一个 GitHub Issue** |
+| 审核界面 | `/admin` 网页，或 `pwdash review` | GitHub Issue 列表，或 `/admin` |
+| 审核通过 | 更新 KV + commit 回仓库 | 关 Issue + commit 回仓库 |
+| 适合 | 有人频繁投稿 | 不想用 KV、想全程留在 GitHub 里 |
+
+纯 GitHub 模式的隐藏好处：**每一条投稿都在 Issue 里留痕**，谁、什么时候、提交了什么，GitHub 帮你记账。
+
+### 成本与配额
+
+- Workers 免费：10 万请求/天；KV 免费：10 万读/天、1000 写/天
+- Pages 免费：无限静态请求、500 次构建/月
+- GitHub API：PAT 5000 次/小时（审核回写才用到）
+
+个人自用完全够。唯一要留意的是 KV 的**写**额度（1000/天），大批量导入请用 `--bulk` 一次推完，而不是逐条 `--upload`。
+
+### 安全清单
+
+- [ ] `ADMIN_TOKEN` 换成长随机串（`openssl rand -hex 24`），别用示例值
+- [ ] `GH_TOKEN` 用细粒度 PAT，只授权这一个仓库
+- [ ] `CORS_ORIGIN` 从 `*` 改成你的 Pages 域名，避免别人拿你的 Worker 当免费 API
+- [ ] 投稿保持 `CONTRIB_MODE=queue`，别用 `auto`
+- [ ] Worker 密钥只放 `wrangler secret`，绝不写进 `wrangler.toml` / 仓库
+- [ ] 定期在 GitHub 上看 commit 历史，发现异常数据直接 revert
+
+---
+
+## 其它部署方式
+
+**GitHub Pages**（纯静态，后端用 Worker 时也够用）
 
 1. 把 `index.html`、`manifest.webmanifest`、`sw.js`、`assets/`、`passwords_local.json` 推到仓库默认分支；
 2. Settings → Pages → Source 选该分支根目录；
@@ -304,6 +467,8 @@ curl -X POST https://你的域名/bulk \
 **Cloudflare Pages / Netlify**：构建命令留空，输出目录填仓库根目录即可。
 
 **自建**：`python3 tools/serve.py --bind 0.0.0.0 --port 8080`，或任何静态服务器。
+
+**没有服务器也能跑后端**：见上面 [全托管部署](#全托管部署github--cloudflare-workers--pages)。
 
 ---
 
@@ -334,6 +499,7 @@ bash tests/smoke.sh        # 70 项：库读写、清洗、CLI、解压、服务
 npm install jsdom
 node tests/dom_test.mjs                                    # 31 项，用真实 app.js 跑交互
 node tests/web_test.mjs --chrome "$(which google-chrome)"   # 真浏览器 CDP 端到端
+node tests/worker_test.mjs                                 # 54 项，Worker 双后端（mock KV + mock GitHub）
 ```
 
 `smoke.sh` 全程使用临时目录与随机端口，不会动仓库里的真实密码库。
@@ -373,6 +539,13 @@ node tests/web_test.mjs --chrome "$(which google-chrome)"   # 真浏览器 CDP �
 
 **Q：别人怎么给我投稿？**
 见 [让别人上传 MD5 和密码](#让别人上传-md5-和密码)。默认是「投稿进队列 → 我审核」，不会污染主库。
+
+**Q：不想买服务器，能只用 GitHub + Cloudflare 吗？**
+能。Worker 就是为这个场景写的，见 [全托管部署](#全托管部署github--cloudflare-workers--pages)：
+GitHub 存数据，Workers 跑接口，Pages 跑前端，全程免费。
+
+**Q：Worker 和 server/server.py 冲突吗？**
+不冲突。两者接口一致，可以只跑一个：想零运维就用 Worker；想完全自己掌控数据就用 Python 服务。
 
 **Q：投稿队列积压了怎么办？**
 `./pwdash --server <地址> --token <口令> review --list` 看清单，`--approve all` 一次过；
