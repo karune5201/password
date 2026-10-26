@@ -38,6 +38,7 @@
 | 多数据源 | 按优先级依次尝试，任一可用即生效；可在设置里增删、排序、启停 |
 | 离线可用 | 整库缓存到 localStorage + Service Worker，断网照样查 |
 | 导入/导出 | 支持导入 `.json` 与 `.json.gz`（就地解压），随时导出当前库 |
+| 公开投稿 | 「投稿」页签可把自己的密码提交给别人（进审核队列），支持从文件取 MD5 |
 | 无痕 | 无埋点、无外链图片/字体，纯本地渲染 |
 | 其他 | 深/浅色主题、查询历史、`/` 与 `Ctrl+K` 快捷键、`?md5=` 直达、可安装为 PWA |
 
@@ -52,6 +53,7 @@
 **服务端（`server/server.py`，纯标准库）**
 
 - `GET /query/<md5>`、`POST /upload`、`POST /bulk`、`GET /db`、`GET /stats`、`GET /health`
+- 公开投稿：`POST /contribute`、`GET /contrib/count`、`GET /contrib/pending`、`POST /contrib/approve|reject`
 - token 鉴权 + 按 IP 限流 + 请求体上限 + 默认只监听本机
 - 日志只记路径与状态码，永不打印密码
 
@@ -80,12 +82,13 @@ password/
 │   ├── serve.py            # 本地预览静态服务
 │   └── git-menu.sh         # 通用 git 操作菜单（原 1.sh）
 ├── tests/
-│   ├── smoke.sh            # 全链路自测（51 项）
+│   ├── smoke.sh            # 全链路自测（70 项）
 │   ├── dom_test.mjs        # jsdom 跑真实 app.js（29 项）
 │   └── web_test.mjs        # 无头 Chrome 端到端（CDP，无需 puppeteer）
 ├── passwords_local.json    # 网页版明文库（发到 GitHub 供前端 fetch）
 ├── passwords_local.json.gz # 命令行用压缩库
 ├── data/rejected.json      # 被清洗掉的脏记录（备查，不参与查询）
+├── pending_uploads.json.gz # 公开投稿的待审队列（首次有投稿时自动生成）
 ├── 1.py / 2.py             # 旧入口的兼容壳（等价于 pwdkit menu / build_db）
 └── pwdash                   # 命令行快捷入口
 ```
@@ -194,6 +197,8 @@ export PWDASH_TOKEN=换个长口令
 | `export [-o 文件] [-f json\|gz\|pretty]` | 导出 |
 | `import <文件> [--overwrite]` | 合并导入 |
 | `extract <压缩包> [-p 密码] [-o 目录] [--no-db] [--verify-only] [--force] [--upload]` | 解压 |
+| `contribute [密码] [--md5 M]` | 把一条密码投稿到别人的服务端 |
+| `review [--list] [--approve\|--reject MD5\|all] [--reveal]` | 管理员处理待审投稿 |
 | `sync push\|pull [--overwrite]` | 与服务端同步 |
 | `doctor` | 环境体检 |
 | `menu` | 交互菜单 |
@@ -220,6 +225,69 @@ python3 tools/build_db.py --report data/rejected.json           # 导出被剔�
 清洗规则：key 必须是 32 位 MD5、密码非空、长度 ≤ 256。被剔除的记录写入 `data/rejected.json`
 而不是直接丢掉，可人工复核。**写入都是原子操作**（临时文件 + `os.replace` + 文件锁），
 中途断电或并发写入不会把库写坏。
+
+---
+
+## 让别人上传 MD5 和密码
+
+三种方式，按「要不要自己运维」自行选择。
+
+### 方式 A：开自建服务端 + 公开投稿（推荐）
+
+服务端默认就是 `queue` 模式——**谁都能提交，但必须你审核才进库**，不会被灌垃圾。
+
+```bash
+# 1. 起服务（对外就加 HTTPS 反代；token 是审核口令，务必改）
+PWDASH_TOKEN=$(openssl rand -hex 16) python3 server/server.py --bind 0.0.0.0 --port 5000
+
+# 2. 告诉别人你的地址，他们这样投稿：
+#    网页：设置里填服务端地址 → 「投稿」页签 → 填密码 → 提交
+#    命令行：
+./pwdash --server https://你的域名 contribute '解压密码'
+./pwdash --server https://你的域名 contribute --md5 <32位md5> '解压密码'
+
+# 3. 你审核（在有 token 的机器上）
+./pwdash --server https://你的域名 --token $PWDASH_TOKEN review --list
+./pwdash --server https://你的域名 --token $PWDASH_TOKEN review --approve all
+./pwdash --server https://你的域名 --token $PWDASH_TOKEN review --reject <md5>
+```
+
+投稿三种模式用 `--contrib-mode` 切换（也可用环境变量 `PWDASH_CONTRIB_MODE`）：
+
+| 模式 | 行为 | 适用 |
+| --- | --- | --- |
+| `queue`（默认） | 进 `pending_uploads.json.gz` 待审，审核通过才进主库 | 开放给陌生人 |
+| `auto` | 校验通过直接入库 | 只给信任的群友 |
+| `off` | `POST /contribute` 返回 403 | 完全关闭 |
+
+投稿侧的保护：每 IP 每小时最多 `CONTRIB_LIMIT`（默认 10）次，超出返回 429；
+待审队列超过 `contrib_max_pending`（默认 500）条时拒收；已存在或已在队列里的记录不会重复堆积。
+
+### 方式 B：发一个共享 token 给信任的人，直接写库
+
+```bash
+# 对方直接批量推送，无需审核（慎用，务必只给熟人）
+curl -X POST https://你的域名/bulk \
+  -H "Authorization: Bearer $SHARED_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"entries":{"<md5>":"<密码>"},"overwrite":false}'
+
+# 或让对方在本地整理好库后整库同步
+./pwdash --server https://你的域名 --token $SHARED_TOKEN sync push
+```
+
+### 方式 C：不用服务端，走 GitHub
+
+- 让对方 **fork 仓库 → 改 `passwords_local.json` → 提 PR**，你合并后线上立刻生效；
+- 或者开一个 Issue 模板收投稿，你手动 `./pwdash add --from-password '密码'` 再 push。
+
+这种方式零运维、全程留痕，代价是要人工合并。
+
+### 投稿相关的安全提醒
+
+- 匿名投稿**一定要用 `queue` 模式**：`auto` 模式下任何人能往你的库里塞任意字符串；
+- 公网部署必须配 `PWDASH_TOKEN`（否则程序拒绝监听 `0.0.0.0`），并放在 HTTPS 反代之后；
+- 投稿内容可能是别人的私人密码，公开库等于公开它——审核时看清楚再放行；
+- 定期备份 `passwords_local.json.gz` 与 `pending_uploads.json.gz`。
 
 ---
 
@@ -257,14 +325,14 @@ python3 tools/build_db.py --report data/rejected.json           # 导出被剔�
 ## 测试
 
 ```bash
-bash tests/smoke.sh        # 51 项：库读写、清洗、CLI、解压、服务端、前端资源
+bash tests/smoke.sh        # 70 项：库读写、清洗、CLI、解压、服务端、投稿审核、前端资源
 ```
 
 需要 Node 时可选跑前端：
 
 ```bash
 npm install jsdom
-node tests/dom_test.mjs                                    # 29 项，用真实 app.js 跑交互
+node tests/dom_test.mjs                                    # 31 项，用真实 app.js 跑交互
 node tests/web_test.mjs --chrome "$(which google-chrome)"   # 真浏览器 CDP 端到端
 ```
 
@@ -302,6 +370,13 @@ node tests/web_test.mjs --chrome "$(which google-chrome)"   # 真浏览器 CDP �
 
 **Q：AES-256 加密的 zip 解不开？**
 需要 `pyzipper`（Python 侧）或 `7z` 命令行，程序会自动挑可用的那个。
+
+**Q：别人怎么给我投稿？**
+见 [让别人上传 MD5 和密码](#让别人上传-md5-和密码)。默认是「投稿进队列 → 我审核」，不会污染主库。
+
+**Q：投稿队列积压了怎么办？**
+`./pwdash --server <地址> --token <口令> review --list` 看清单，`--approve all` 一次过；
+也可以 `--reject all` 全部丢弃。
 
 **Q：MD5 是怎么算的？**
 整文件按字节流式计算，与 `md5sum` / `md5` 结果一致；网页端与命令行实现已互相对拍验证。

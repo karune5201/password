@@ -34,6 +34,7 @@
       <button class="tab is-active" role="tab" data-mode="md5" aria-selected="true">按 MD5</button>
       <button class="tab" role="tab" data-mode="file" aria-selected="false">拖入文件</button>
       <button class="tab" role="tab" data-mode="batch" aria-selected="false">批量</button>
+      <button class="tab" role="tab" data-mode="contrib" aria-selected="false">投稿</button>
     </div>
 
     <div class="panel" id="panel-md5" role="tabpanel">
@@ -78,6 +79,25 @@
         <button class="btn primary" id="btn-batch-query" type="button">批量查询</button>
         <button class="btn ghost" id="btn-batch-copy" type="button">复制全部结果</button>
       </div>
+    </div>
+
+    <div class="panel hidden" id="panel-contrib" role="tabpanel">
+      <div class="field">
+        <label class="field-label" for="contrib-password">要分享的解压密码</label>
+        <input id="contrib-password" type="password" autocomplete="off" spellcheck="false"
+               placeholder="填完整密码，提交后由管理员审核">
+      </div>
+      <div class="field">
+        <label class="field-label" for="contrib-md5">对应文件 MD5（可留空，默认按密码反算）</label>
+        <input id="contrib-md5" type="text" autocomplete="off" spellcheck="false" maxlength="64"
+               placeholder="32 位 MD5，留空则由服务端按密码计算">
+      </div>
+      <div class="row">
+        <button class="btn primary" id="btn-contrib" type="button">提交投稿</button>
+        <button class="btn ghost" id="btn-contrib-file" type="button">从文件取 MD5</button>
+        <input type="file" id="contrib-file-input" hidden>
+      </div>
+      <p class="field-hint" id="contrib-hint">投稿会发到「设置 → 私有服务端」里配置的地址，需对方开启投稿。</p>
     </div>
 
     <div class="result" id="result" aria-live="polite" aria-atomic="true"></div>

@@ -507,6 +507,101 @@ def cmd_sync(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_contribute(args: argparse.Namespace) -> int:
+    """把一条密码提交到别人的服务端（走公开投稿接口，无需 token）。"""
+    pwd = args.password or ask_password("要投稿的密码（不回显）: ")
+    if not pwd.strip():
+        fail("密码不能为空")
+        return EXIT_USAGE
+    payload = {"password": pwd.strip()}
+    if args.md5:
+        payload["md5"] = args.md5
+    elif not args.derive:
+        payload["md5"] = pwlib.md5_of(pwd.strip())
+
+    base = (args.server or DEFAULT_SERVER).rstrip("/")
+    try:
+        status, data = http_json(f"{base}/contribute", method="POST", payload=payload)
+    except ConnectionError as exc:
+        fail(f"无法连接 {base}: {exc}")
+        return EXIT_NET
+
+    state = data.get("status", "")
+    if status == 202:
+        ok(f"已提交，等待管理员审核（MD5 {data.get('md5')}）")
+        return EXIT_OK
+    if status == 201:
+        ok(f"已收录（MD5 {data.get('md5')}）")
+        return EXIT_OK
+    if status == 200 and state == "exists":
+        info("ℹ️  库里已经有这条记录了，无需重复提交")
+        return EXIT_OK
+    if status == 200 and state == "already_pending":
+        info("ℹ️  这条已经在待审队列里了")
+        return EXIT_OK
+    if status == 403:
+        fail("对方未开放投稿")
+        return EXIT_USAGE
+    if status == 429:
+        fail(data.get("error") or "投稿过于频繁，稍后再试")
+        return EXIT_NET
+    fail(f"提交失败: {data.get('error', status)}")
+    return EXIT_NET
+
+
+def cmd_review(args: argparse.Namespace) -> int:
+    """管理员视角：查看 / 通过 / 拒绝待审投稿。"""
+    base = (args.server or DEFAULT_SERVER).rstrip("/")
+    token = args.token or os.environ.get("PWDASH_TOKEN", "")
+    if not token:
+        warn("未提供 token；服务端若设置了 PWDASH_TOKEN 会拒绝访问")
+
+    # 没有任何动作参数时，默认列出来
+    do_list = args.list or (not args.approve and not args.reject)
+
+    if do_list:
+        try:
+            status, data = http_json(f"{base}/contrib/pending", token=token)
+        except ConnectionError as exc:
+            fail(f"无法连接 {base}: {exc}")
+            return EXIT_NET
+        if status == 401:
+            fail("需要 token（--token 或 PWDASH_TOKEN）")
+            return EXIT_NET
+        if status != 200:
+            fail(f"拉取失败: {data.get('error', status)}")
+            return EXIT_NET
+
+        entries = data.get("entries") or {}
+        if not entries:
+            info("📭 没有待审投稿")
+            return EXIT_OK
+        for md5, pwd in sorted(entries.items()):
+            shown = pwd if args.reveal else pwlib.mask(pwd)
+            print(f"{md5}  {shown}")
+        info(f"{C.DIM}共 {len(entries)} 条待审；用 --approve <md5|all> 或 --reject <md5|all> 处理{C.RESET}")
+        return EXIT_OK
+
+    if args.approve:
+        path, ids, word = "/contrib/approve", args.approve, "通过"
+    else:
+        path, ids, word = "/contrib/reject", args.reject, "拒绝"
+    payload = {"all": True} if ids == ["all"] else {"ids": ids}
+
+    try:
+        status, data = http_json(f"{base}{path}", method="POST", payload=payload, token=token)
+    except ConnectionError as exc:
+        fail(f"无法连接 {base}: {exc}")
+        return EXIT_NET
+    if status != 200:
+        fail(f"操作失败: {data.get('error', status)}")
+        return EXIT_NET
+    ok(f"已{word} {len(data.get('done', []))} 条，剩余待审 {data.get('pending')} 条")
+    if data.get("skipped"):
+        warn(f"跳过（队列里没有）: {', '.join(data['skipped'][:5])}")
+    return EXIT_OK
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     print(f"🧬 Python {sys.version.split()[0]} / {sys.platform}")
     print(f"📚 库路径: {pwlib.default_db_path()}")
@@ -699,6 +794,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("action", choices=["push", "pull"])
     p.add_argument("--overwrite", action="store_true")
     p.set_defaults(func=cmd_sync)
+
+    p = sub.add_parser("contribute", help="把一条密码投稿到别人的服务端")
+    p.add_argument("password", nargs="?", help="密码（省略则交互输入）")
+    p.add_argument("--md5", help="指定 MD5（默认按密码反算）")
+    p.add_argument("--derive", action="store_true", help="强制由服务端反算 MD5")
+    p.set_defaults(func=cmd_contribute)
+
+    p = sub.add_parser("review", help="管理员：处理待审投稿")
+    p.add_argument("--list", action="store_true", help="列出待审（默认动作）")
+    p.add_argument("--approve", nargs="+", metavar="MD5|all", help="通过并入库")
+    p.add_argument("--reject", nargs="+", metavar="MD5|all", help="拒绝并丢弃")
+    p.add_argument("--reveal", action="store_true", help="显示密码明文")
+    p.set_defaults(func=cmd_review)
 
     p = sub.add_parser("doctor", help="环境体检")
     p.set_defaults(func=cmd_doctor)

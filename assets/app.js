@@ -649,6 +649,83 @@
     }
   }
 
+
+  // ------------------------------------------------------------------
+  // 投稿：把密码提交到服务端（走公开 /contribute 接口，进审核队列）
+  // ------------------------------------------------------------------
+  async function submitContribution() {
+    const pwdInput = $('contrib-password');
+    const md5Input = $('contrib-md5');
+    const hint = $('contrib-hint');
+    const password = pwdInput.value.trim();
+    const md5raw = md5Input.value.trim();
+
+    const setHint = (text, bad) => {
+      hint.textContent = text;
+      hint.classList.toggle('warn', Boolean(bad));
+    };
+
+    if (!password) {
+      setHint('请先填写要分享的密码。', true);
+      pwdInput.focus();
+      return;
+    }
+    if (md5raw && !normalizeInput(md5raw)) {
+      setHint('MD5 格式不对：要么留空，要么填 32 位十六进制。', true);
+      return;
+    }
+    if (!state.server.url) {
+      setHint('还没有配置服务端。点右上角 ⚙️ 填入服务端地址（形如 https://你的域名）后再投稿。', true);
+      openSettings();
+      return;
+    }
+
+    const btn = $('btn-contrib');
+    btn.disabled = true;
+    setHint('正在提交…');
+    try {
+      const headers = { 'Content-Type': 'application/json' };
+      if (state.server.token) headers.Authorization = `Bearer ${state.server.token}`;
+      const payload = { password };
+      if (md5raw) payload.md5 = normalizeInput(md5raw);
+
+      const resp = await fetch(`${state.server.url.replace(/\/+$/, '')}/contribute`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+        credentials: 'omit',
+      });
+      const data = await resp.json().catch(() => ({}));
+
+      if (resp.status === 202) {
+        setHint('已提交 ✅ 待管理员审核通过后即可被查到。');
+        pwdInput.value = '';
+        md5Input.value = '';
+        toast('投稿已提交，等待审核');
+      } else if (resp.status === 201) {
+        setHint('已收录 ✅ 现在就能查到这条记录。');
+        pwdInput.value = '';
+        md5Input.value = '';
+        toast('投稿已收录');
+        refreshDb({ force: true }).catch(() => {});
+      } else if (resp.status === 200 && data.status === 'exists') {
+        setHint('这条记录库里已经有了，无需重复提交。');
+      } else if (resp.status === 200 && data.status === 'already_pending') {
+        setHint('这条已经在待审队列里了，稍等管理员处理。');
+      } else if (resp.status === 403) {
+        setHint('对方没有开放投稿。', true);
+      } else if (resp.status === 429) {
+        setHint('投稿太频繁了，过一会儿再试。', true);
+      } else {
+        setHint(`提交失败：${data.error || 'HTTP ' + resp.status}`, true);
+      }
+    } catch (err) {
+      setHint(`连不上服务端：${(err && err.message) || err}`, true);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
   // ------------------------------------------------------------------
   // 模式切换
   // ------------------------------------------------------------------
@@ -661,6 +738,7 @@
     $('panel-md5').classList.toggle('hidden', mode !== 'md5');
     $('panel-file').classList.toggle('hidden', mode !== 'file');
     $('panel-batch').classList.toggle('hidden', mode !== 'batch');
+    $('panel-contrib').classList.toggle('hidden', mode !== 'contrib');
   }
 
   // ------------------------------------------------------------------
@@ -930,6 +1008,24 @@
         return;
       }
       copy(rows.map((r) => `${r.md5}\t${r.pwd}`).join('\n'), `已复制 ${rows.length} 条结果`);
+    });
+
+    // 投稿
+    $('btn-contrib').addEventListener('click', submitContribution);
+    $('btn-contrib-file').addEventListener('click', () => $('contrib-file-input').click());
+    $('contrib-file-input').addEventListener('change', async (e) => {
+      const file = e.target.files && e.target.files[0];
+      e.target.value = '';
+      if (!file || !window.Md5) return;
+      const hint = $('contrib-hint');
+      hint.textContent = '正在计算文件 MD5…';
+      try {
+        const md5 = await window.Md5.hashFile(file);
+        $('contrib-md5').value = md5;
+        hint.textContent = `已填入 ${file.name} 的 MD5（${md5}）`;
+      } catch (err) {
+        hint.textContent = '计算 MD5 失败：' + ((err && err.message) || err);
+      }
     });
 
     // 历史

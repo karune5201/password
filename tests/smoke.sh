@@ -199,6 +199,61 @@ check "CLI sync pull" "0" "$?"
 
 kill "$SRV_PID" 2>/dev/null; SRV_PID=""
 
+
+echo
+echo "=== 6b. 公开投稿 + 审核队列 ==="
+# 每个场景用独立库 + 独立待审文件
+CT="$TMP/ct"; mkdir -p "$CT"
+cp "$ROOT/passwords_local.json.gz" "$CT/db.json.gz"
+CPORT=$(( PORT + 1 ))
+PWDASH_TOKEN=testtoken python3 "$ROOT/server/server.py" --port "$CPORT" --db "$CT/db.json.gz" \
+  --pending "$CT/pending.json.gz" --contrib-mode queue >"$CT/srv.log" 2>&1 &
+SRV_PID=$!
+for _ in $(seq 1 40); do curl -sf -m 1 "http://127.0.0.1:$CPORT/health" >/dev/null 2>&1 && break; sleep 0.2; done
+CB="http://127.0.0.1:$CPORT"
+NEWMD5=$(python3 -c "import hashlib;print(hashlib.md5(b'community-pass').hexdigest())")
+
+check "匿名投稿入队" "202" "$(curl -s -o /dev/null -w '%{http_code}' -X POST $CB/contribute -H 'Content-Type: application/json' -d '{"password":"community-pass"}')"
+check "重复投稿不重复入队" "200" "$(curl -s -o /dev/null -w '%{http_code}' -X POST $CB/contribute -H 'Content-Type: application/json' -d '{"password":"community-pass"}')"
+check "空密码被拒" "400" "$(curl -s -o /dev/null -w '%{http_code}' -X POST $CB/contribute -H 'Content-Type: application/json' -d '{"password":""}')"
+check "非法 MD5 被拒" "400" "$(curl -s -o /dev/null -w '%{http_code}' -X POST $CB/contribute -H 'Content-Type: application/json' -d '{"md5":"zzz","password":"p"}')"
+check "未审核前查不到" "404" "$(curl -s -o /dev/null -w '%{http_code}' $CB/query/$NEWMD5)"
+check "待审数量公开可读" "1" "$(curl -s $CB/contrib/count | python3 -c 'import json,sys;print(json.load(sys.stdin)["pending"])')"
+check "待审列表需 token" "401" "$(curl -s -o /dev/null -w '%{http_code}' $CB/contrib/pending)"
+check "待审列表带 token" "200" "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer testtoken' $CB/contrib/pending)"
+check "审核通过需 token" "401" "$(curl -s -o /dev/null -w '%{http_code}' -X POST $CB/contrib/approve -H 'Content-Type: application/json' -d '{"all":true}')"
+check "审核通过" "200" "$(curl -s -o /dev/null -w '%{http_code}' -X POST $CB/contrib/approve -H 'Authorization: Bearer testtoken' -H 'Content-Type: application/json' -d '{"all":true}')"
+check "审核后可查到" "community-pass" "$(curl -s $CB/query/$NEWMD5 | python3 -c 'import json,sys;print(json.load(sys.stdin).get("password",""))')"
+check "审核后队列清空" "0" "$(curl -s $CB/contrib/count | python3 -c 'import json,sys;print(json.load(sys.stdin)["pending"])')"
+check "拒绝投稿不入库" "200" "$(curl -s -o /dev/null -w '%{http_code}' -X POST $CB/contrib/reject -H 'Authorization: Bearer testtoken' -H 'Content-Type: application/json' -d '{"ids":["'$NEWMD5'"]}')"
+kill "$SRV_PID" 2>/dev/null; SRV_PID=""
+
+# 关闭投稿模式
+PWDASH_TOKEN=testtoken python3 "$ROOT/server/server.py" --port "$CPORT" --db "$CT/db2.json.gz" \
+  --contrib-mode off >"$CT/srv2.log" 2>&1 &
+SRV_PID=$!
+for _ in $(seq 1 40); do curl -sf -m 1 "http://127.0.0.1:$CPORT/health" >/dev/null 2>&1 && break; sleep 0.2; done
+check "关闭投稿后返回 403" "403" "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:$CPORT/contribute -H 'Content-Type: application/json' -d '{"password":"x"}')"
+kill "$SRV_PID" 2>/dev/null; SRV_PID=""
+
+# CLI 投稿与审核命令（重新起一个 queue 模式服务）
+PWDASH_TOKEN=testtoken python3 "$ROOT/server/server.py" --port "$CPORT" --db "$CT/db3.json.gz" \
+  --pending "$CT/pending3.json.gz" --contrib-mode queue >"$CT/srv3.log" 2>&1 &
+SRV_PID=$!
+for _ in $(seq 1 40); do curl -sf -m 1 "http://127.0.0.1:$CPORT/health" >/dev/null 2>&1 && break; sleep 0.2; done
+C3="http://127.0.0.1:$CPORT"
+python3 "$ROOT/cli/pwdkit.py" --server "$C3" contribute cli-pass >/dev/null 2>&1
+check "CLI contribute 提交成功" "0" "$?"
+python3 "$ROOT/cli/pwdkit.py" --server "$C3" --token testtoken review --list >/dev/null 2>&1
+check "CLI review --list" "0" "$?"
+CLIMD5=$(python3 -c "import hashlib;print(hashlib.md5(b'cli-pass').hexdigest())")
+python3 "$ROOT/cli/pwdkit.py" --server "$C3" --token testtoken review --approve "$CLIMD5" >/dev/null 2>&1
+check "CLI review --approve" "0" "$?"
+check "CLI 审核后服务端可查" "cli-pass" "$(curl -s $C3/query/$CLIMD5 | python3 -c 'import json,sys;print(json.load(sys.stdin).get("password",""))')"
+python3 "$ROOT/cli/pwdkit.py" --server "$C3" --token wrong review --list >/dev/null 2>&1
+check "错误 token 被拒（退出码 7）" "7" "$?"
+kill "$SRV_PID" 2>/dev/null; SRV_PID=""
+
 echo
 echo "=== 7. 前端资源 ==="
 for f in index.html sw.js manifest.webmanifest assets/app.css assets/app.js assets/md5.js assets/icon.svg assets/icon-192.png assets/icon-512.png; do

@@ -47,6 +47,8 @@ VERSION = "2.0"
 MAX_BODY = 32 * 1024 * 1024
 READ_LIMIT = 240        # 每分钟每 IP 读请求数
 WRITE_LIMIT = 60        # 每分钟每 IP 写请求数
+CONTRIB_LIMIT = 10      # 每 IP 每小时最多投稿数（防灌库）
+CONTRIB_WINDOW = 3600.0
 
 
 class RateLimiter:
@@ -72,9 +74,22 @@ class RateLimiter:
 class App:
     """与 HTTP 无关的业务部分，方便单测。"""
 
-    def __init__(self, db_path: "str | None" = None, token: str = ""):
+    def __init__(
+        self,
+        db_path: "str | None" = None,
+        token: str = "",
+        *,
+        contrib_mode: str = "queue",
+        contrib_max_pending: int = 500,
+        pending_path: "str | None" = None,
+    ):
         self.store = pwlib.Store(db_path)
         self.token = token
+        self.contrib_mode = contrib_mode
+        self.contrib_max_pending = contrib_max_pending
+        # 待审队列与主库共用一个目录，文件名固定，便于备份
+        base_dir = os.path.dirname(self.store.path) or "."
+        self.pending = pwlib.Store(pending_path or os.path.join(base_dir, "pending_uploads.json.gz"))
 
     # ---- 鉴权 ----
     def auth_ok(self, header: "str | None", client_ip: str) -> bool:
@@ -126,6 +141,96 @@ class App:
 
     def dump(self) -> dict:
         return {"entries": self.store.load(), "stats": self.store.stats()}
+
+    # ---- 公开投稿：任何人都能提交，默认进审核队列 ----
+    def contribute(self, payload: "dict", client_ip: str) -> "tuple[int, dict]":
+        """mode=off 拒绝 / queue 进待审列表 / auto 直接入库。"""
+        if self.contrib_mode == "off":
+            return HTTPStatus.FORBIDDEN, {"error": "本站未开放投稿"}
+
+        password = payload.get("password")
+        md5 = payload.get("md5")
+        if not isinstance(password, str) or not password.strip():
+            return HTTPStatus.BAD_REQUEST, {"error": "请填写密码"}
+        password = password.strip()
+        if len(password) > 256:
+            return HTTPStatus.BAD_REQUEST, {"error": "密码过长（>256）"}
+        if md5 in (None, ""):
+            md5 = pwlib.md5_of(password)
+        try:
+            md5 = pwlib.normalize_md5(str(md5))
+        except ValueError as exc:
+            return HTTPStatus.BAD_REQUEST, {"error": str(exc)}
+
+        # 已经有了：不重复收，直接告诉对方
+        try:
+            if self.store.get(md5):
+                return HTTPStatus.OK, {"status": "exists", "md5": md5}
+        except pwlib.DBError as exc:
+            return HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)}
+
+        # 待审里也不能重复堆积
+        try:
+            if self.pending.get(md5):
+                return HTTPStatus.OK, {"status": "already_pending", "md5": md5}
+        except pwlib.DBError as exc:
+            return HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)}
+
+        if self.contrib_mode == "auto":
+            self.store.put(md5, password)
+            return HTTPStatus.CREATED, {"status": "accepted", "md5": md5}
+
+        # 队列模式：容量上限，防止被刷爆磁盘
+        pending_count = len(self.pending.load())
+        if pending_count >= self.contrib_max_pending:
+            return HTTPStatus.TOO_MANY_REQUESTS, {
+                "error": "待审队列已满，请稍后再试",
+                "pending": pending_count,
+            }
+
+        self.pending.put(md5, password)
+        return HTTPStatus.ACCEPTED, {
+            "status": "pending",
+            "md5": md5,
+            "message": "已提交，等管理员审核后生效",
+            "pending": pending_count + 1,
+        }
+
+    def pending_view(self) -> dict:
+        entries = self.pending.load()
+        return {"count": len(entries), "entries": entries}
+
+    def review(self, payload: "dict", *, approve: bool) -> "tuple[int, dict]":
+        """审核：approve=True 入库，False 丢弃。ids 支持列表或 all=true。"""
+        pending = self.pending.load()
+        if payload.get("all"):
+            targets = list(pending.keys())
+        else:
+            ids = payload.get("ids")
+            if isinstance(ids, str):
+                ids = [ids]
+            if not isinstance(ids, list) or not ids:
+                return HTTPStatus.BAD_REQUEST, {"error": "需要 ids 列表或 all=true"}
+            targets = [str(i).strip().lower() for i in ids]
+
+        done, skipped = [], []
+        for md5 in targets:
+            pwd = pending.get(md5)
+            if pwd is None:
+                skipped.append(md5)
+                continue
+            if approve:
+                self.store.put(md5, pwd)
+            self.pending.delete(md5)
+            done.append(md5)
+
+        return HTTPStatus.OK, {
+            "approved": len(done) if approve else 0,
+            "rejected": 0 if approve else len(done),
+            "done": done,
+            "skipped": skipped,
+            "pending": len(self.pending.load()),
+        }
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -218,6 +323,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(HTTPStatus.OK, self.app.dump())
             return
+        if path == "/contrib/count":
+            self._send(HTTPStatus.OK, {"pending": len(self.app.pending.load())})
+            return
+        if path == "/contrib/pending":
+            if not self.app.auth_ok(self.headers.get("Authorization"), ip):
+                self._send(HTTPStatus.UNAUTHORIZED, {"error": "需要有效 token"})
+                return
+            self._send(HTTPStatus.OK, self.app.pending_view())
+            return
         if path.startswith("/query/"):
             raw = path[len("/query/") :]
             try:
@@ -243,6 +357,24 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         path = urlparse(self.path).path.rstrip("/") or "/"
+
+        # 公开投稿单独限流（比普通写接口更严），且不需要 token
+        if path == "/contribute":
+            if not self.limiter.allow(ip, "contrib", CONTRIB_LIMIT, window=CONTRIB_WINDOW):
+                self._send(
+                    HTTPStatus.TOO_MANY_REQUESTS,
+                    {"error": "投稿太频繁，请稍后再试"},
+                )
+                return
+            payload, err = self._read_json()
+            if err:
+                self._send(HTTPStatus.BAD_REQUEST, {"error": err})
+                return
+            assert payload is not None
+            status, body = self.app.contribute(payload, ip)
+            self._send(status, body)
+            return
+
         payload, err = self._read_json()
         if err:
             self._send(HTTPStatus.BAD_REQUEST, {"error": err})
@@ -264,6 +396,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(HTTPStatus.UNAUTHORIZED, {"error": "需要有效 token"})
                 return
             status, body = self.app.bulk(payload)
+            self._send(status, body)
+            return
+        if path in ("/contrib/approve", "/contrib/reject"):
+            if not self.app.auth_ok(self.headers.get("Authorization"), ip):
+                self._send(HTTPStatus.UNAUTHORIZED, {"error": "审核需要有效 token"})
+                return
+            status, body = self.app.review(payload, approve=(path == "/contrib/approve"))
             self._send(status, body)
             return
 
@@ -300,9 +439,17 @@ class FastBindHTTPServer(ThreadingHTTPServer):
         self.server_port = port
 
 
-def make_server(bind: str, port: int, db: "str | None", token: str, cors: str) -> ThreadingHTTPServer:
+def make_server(
+    bind: str,
+    port: int,
+    db: "str | None",
+    token: str,
+    cors: str,
+    contrib_mode: str = "queue",
+    pending_path: "str | None" = None,
+) -> ThreadingHTTPServer:
     handler = type("BoundHandler", (Handler,), {})
-    handler.app = App(db, token)
+    handler.app = App(db, token, contrib_mode=contrib_mode, pending_path=pending_path)
     handler.limiter = RateLimiter()
     handler.cors_origin = cors
     return FastBindHTTPServer((bind, port), handler)
@@ -315,7 +462,18 @@ def main(argv: "list[str] | None" = None) -> int:
     ap.add_argument("--bind", default="127.0.0.1", help="监听地址，默认 127.0.0.1（仅本机）")
     ap.add_argument("--port", type=int, default=5000)
     ap.add_argument("--db", help="数据库路径")
-    ap.add_argument("--cors", default="", help="允许的跨域来源，如 https://example.com")
+    ap.add_argument("--cors", default="", help="允许的跨域来源，如 * 或 https://example.com")
+    ap.add_argument(
+        "--contrib-mode",
+        choices=["queue", "auto", "off"],
+        default=os.environ.get("PWDASH_CONTRIB_MODE", "queue"),
+        help="公开投稿模式：queue=进审核队列（默认），auto=直接入库，off=关闭",
+    )
+    ap.add_argument(
+        "--pending",
+        default=os.environ.get("PWDASH_PENDING"),
+        help="待审队列文件路径（默认与主库同目录的 pending_uploads.json.gz）",
+    )
     args = ap.parse_args(argv)
 
     token = os.environ.get("PWDASH_TOKEN", "")
@@ -325,10 +483,19 @@ def main(argv: "list[str] | None" = None) -> int:
         print("❌ 监听非本机地址必须设置 PWDASH_TOKEN", file=sys.stderr)
         return 2
 
-    httpd = make_server(args.bind, args.port, args.db, token, args.cors)
+    httpd = make_server(
+        args.bind,
+        args.port,
+        args.db,
+        token,
+        args.cors,
+        contrib_mode=args.contrib_mode,
+        pending_path=args.pending,
+    )
     store = pwlib.Store(args.db)
     print(f"🚀 pwdash {VERSION} 已启动 → http://{args.bind}:{args.port}", flush=True)
     print(f"📚 数据库: {store.path}（{len(store.load())} 条）")
+    print(f"📝 投稿模式: {args.contrib_mode}（待审 {len(httpd.RequestHandlerClass.app.pending.load())} 条）")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

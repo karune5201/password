@@ -120,7 +120,7 @@ await waitFor(
   '密码库加载'
 );
 check('标题', '密码查询 · pwdash', document.title);
-check('标签页数量', 3, document.querySelectorAll('.tab').length);
+check('标签页数量', 4, document.querySelectorAll('.tab').length);
 check('缓存条目数', entries.length, Object.keys(JSON.parse(window.localStorage.getItem('pwdash.db.v2'))).length);
 check('数据源显示成功', true, !!document.querySelector('#source-list .ok'));
 check('库信息有记录数', true, /\d+ 条记录/.test($('db-meta').textContent));
@@ -196,13 +196,21 @@ $('btn-add-source').click();
 await sleep(100);
 check('拒绝非 http 地址', true, /http\(s\)/.test($('toast').textContent));
 
-console.log('\n=== 11. 清除缓存 ===');
+console.log('\n=== 11. 投稿面板 ===');
+document.querySelector('.tab[data-mode="contrib"]').click();
+check('投稿面板可切换', false, $('panel-contrib').classList.contains('hidden'));
+$('contrib-password').value = 'demo-pass';
+$('btn-contrib').click();
+await sleep(200);
+check('未配置服务端时给出提示', true, /还没有配置服务端/.test($('contrib-hint').textContent));
+
+console.log('\n=== 12. 清除缓存 ===');
 $('btn-clear-cache').click();
 await sleep(120);
 check('缓存被清除', null, window.localStorage.getItem('pwdash.db.v2'));
 check('提示已更新', true, /缓存已清除/.test($('db-meta').textContent));
 
-console.log('\n=== 12. 无 JS 异常 ===');
+console.log('\n=== 13. 无 JS 异常 ===');
 const real = errors.filter((e) => !/Could not parse CSS|Not implemented|serviceWorker/i.test(e));
 check('无运行时异常', [], real.slice(0, 3));
 
