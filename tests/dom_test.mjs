@@ -108,7 +108,12 @@ const dom = await JSDOM.fromURL(BASE, {
       addEventListener() {},
       removeEventListener() {},
     }));
-    window.fetch = (url, opts) => globalThis.fetch(new URL(url, BASE).href, opts);
+    // 测试只访问本次拉起的静态服务：绝不把请求打到真实的 127.0.0.1:5000 / 外网
+    window.fetch = (url, opts) => {
+      const href = new URL(url, BASE).href;
+      if (!href.startsWith(BASE)) throw new Error('测试禁止访问外部地址: ' + href);
+      return globalThis.fetch(href, opts);
+    };
     window.AbortController = globalThis.AbortController;
     window.TextEncoder = globalThis.TextEncoder;
     window.Blob = globalThis.Blob;
@@ -221,6 +226,9 @@ check('拒绝非 http 地址', true, /http\(s\)/.test($('toast').textContent));
 console.log('\n=== 11. 投稿面板 ===');
 document.querySelector('.tab[data-mode="contrib"]').click();
 check('投稿面板可切换', false, $('panel-contrib').classList.contains('hidden'));
+// 本地部署下 DEFAULT_SERVER_URL 会预置成 127.0.0.1:5000，这里显式清空以验证「未配置」分支
+$('server-url').value = '';
+$('server-url').dispatchEvent(new window.Event('change'));
 $('contrib-password').value = 'demo-pass';
 $('btn-contrib').click();
 await sleep(200);

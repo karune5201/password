@@ -42,6 +42,8 @@
 | 离线可用 | 合并结果整库缓存到 localStorage + Service Worker，断网照样查 |
 | 只读设计 | 不提供导入/导出按钮，防止误把别人的库覆盖到自己身上；改库走 CLI |
 | 公开投稿 | 「投稿」页签可把自己的密码提交给别人（进审核队列），支持从文件取 MD5 |
+| 自动加载 | 每次打开页面都自动重新拉取数据源（不再等 6 小时 TTL），失败才回退本地缓存 |
+| 操作记录 | 查询/批量/文件/投稿/设置/库刷新都记一条，存 localStorage，**刷新、关掉再开都还在**；最近查询不存密码明文 |
 | 无痕 | 无埋点、无外链图片/字体，纯本地渲染 |
 | 其他 | 深/浅色主题、查询历史、`/` 与 `Ctrl+K` 快捷键、`?md5=` 直达、可安装为 PWA |
 
@@ -99,7 +101,8 @@ password/
 │   └── git-menu.sh         # 通用 git 操作菜单（原 1.sh）
 ├── tests/
 │   ├── smoke.sh            # 全链路自测（80 项）
-│   ├── dom_test.mjs        # jsdom 跑真实 app.js（29 项）
+│   ├── dom_test.mjs        # jsdom 跑真实 app.js（35 项）
+│   ├── reload_test.mjs     # 刷新自动加载 + 操作记录持久化（23 项）
 │   └── web_test.mjs        # 无头 Chrome 端到端（CDP，无需 puppeteer）
 ├── passwords_local.json    # 网页版明文库（发到 GitHub 供前端 fetch）
 ├── passwords_local.json.gz # 命令行用压缩库
@@ -575,6 +578,7 @@ bash tests/smoke.sh        # 80 项：库读写、清洗、CLI、解压、服务
 ```bash
 npm install jsdom
 node tests/dom_test.mjs                                    # 35 项，用真实 app.js 跑交互
+node tests/reload_test.mjs                                  # 23 项：每次刷新自动加载库 + 操作记录不丢
 node tests/web_test.mjs --chrome "$(which google-chrome)"   # 真浏览器 CDP 端到端
 node tests/worker_test.mjs                                 # 78 项，Worker 双后端 + 多库（mock KV + mock GitHub）
 ```

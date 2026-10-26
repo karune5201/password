@@ -23,7 +23,10 @@
     history: 'pwdash.history.v2',
     theme: 'pwdash.theme.v2',
     server: 'pwdash.server.v2',
+    log: 'pwdash.log.v1',
   };
+
+  const LOG_MAX = 100; // 本地操作记录最多保留多少条
 
   // 部署 Cloudflare Worker 后把地址填在这里，前端首次打开就会自动用它
   // 例：'https://pwdash.your-name.workers.dev'
@@ -58,6 +61,7 @@
     sources: [],
     sourceStates: [],
     history: [],
+    log: [],
     server: { url: '', token: '' },
     busy: false,
     lastBatch: [],
@@ -195,7 +199,17 @@
    * 语义：列表靠前的库优先——同一个 MD5 出现在多个库里时，用靠前那个库的值。
    * 这样可以把「自己的库」放第一位、「陌生人投稿库」放第二位，各库互不覆盖。
    */
-  async function refreshDb(opts) {
+  let refreshInflight = null;
+
+  function refreshDb(opts) {
+    if (refreshInflight) return refreshInflight;
+    refreshInflight = doRefreshDb(opts).finally(() => {
+      refreshInflight = null;
+    });
+    return refreshInflight;
+  }
+
+  async function doRefreshDb(opts) {
     const list = activeSources();
     if (!list.length) throw new Error('没有启用任何数据源');
 
@@ -236,6 +250,7 @@
     }
 
     if (!okCount) {
+      pushLog('db', `数据源全部加载失败：${(lastErr && (lastErr.message || lastErr)) || '未知错误'}`, false);
       if (state.db) {
         renderMeta('（已回退到本地缓存）');
         return state.db;
@@ -250,6 +265,9 @@
     const cached = lsSet(LS.db, merged) && lsSet(LS.meta, state.meta);
     if (!cached) toast('密码库已加载，但本地缓存失败（存储空间不足）', 'err');
     renderMeta();
+    const okLibs = perSource.filter((p) => !p.error);
+    const libText = okLibs.length > 1 ? `${okLibs.length} 个库合并` : (okLibs[0] && okLibs[0].name) || '数据源';
+    pushLog('db', `密码库已更新：${Object.keys(merged).length} 条（${libText}）`, true);
     return state.db;
   }
 
@@ -276,6 +294,14 @@
       count: Object.keys(db).length,
     };
     state.origin = {};
+    // 用缓存里的库信息先渲染一次数据源列表，避免刷新瞬间显示「尚未加载」
+    const cachedSources = Array.isArray(state.meta.sources) ? state.meta.sources : [];
+    state.sourceStates = cachedSources.map((src) => ({
+      name: src.name || src.url || '数据源',
+      url: src.url || '',
+      status: src.error ? 'err' : 'ok',
+      detail: src.error ? String(src.error) : `${src.count || 0} 条（本地缓存）`,
+    }));
     return true;
   }
 
@@ -286,6 +312,10 @@
   // ------------------------------------------------------------------
   // 查询
   // ------------------------------------------------------------------
+  function shortMd5(md5) {
+    return md5 && md5.length > 16 ? `${md5.slice(0, 8)}…${md5.slice(-4)}` : String(md5 || '');
+  }
+
   function normalizeInput(raw) {
     if (typeof raw !== 'string') return '';
     const cleaned = raw.replace(/[\s\-:]/g, '').toLowerCase();
@@ -482,12 +512,63 @@
     info.textContent = `已缓存 ${Object.keys(cached).length} 条${libs > 1 ? `（${libs} 个库合并）` : ''}，约 ${formatBytes(bytes)}，${cacheIsFresh() ? '仍在有效期内' : '已过期，下次打开会尝试刷新'}。离线也能查询。`;
   }
 
-  function pushHistory(md5, pwd) {
+  // 最近查询只记「哪个 MD5、命中与否」，不把密码明文留在 localStorage
+  function pushHistory(md5, found) {
     state.history = state.history.filter((h) => h.md5 !== md5);
-    state.history.unshift({ md5, pwd: pwd || null, ts: Date.now() });
+    state.history.unshift({ md5, found: Boolean(found), ts: Date.now() });
     state.history = state.history.slice(0, HISTORY_MAX);
     lsSet(LS.history, state.history);
     renderHistory();
+  }
+
+  // ------------------------------------------------------------------
+  // 本地操作记录：写 localStorage，刷新 / 关掉再开都还在
+  // ------------------------------------------------------------------
+  const LOG_LABEL = {
+    query: '查询',
+    file: '文件',
+    batch: '批量',
+    contrib: '投稿',
+    db: '库',
+    settings: '设置',
+    cache: '缓存',
+  };
+
+  function pushLog(kind, text, ok) {
+    state.log.unshift({ ts: Date.now(), kind, text: String(text || ''), ok: ok !== false });
+    state.log = state.log.slice(0, LOG_MAX);
+    lsSet(LS.log, state.log);
+    renderLog();
+  }
+
+  function logTime(ts) {
+    const d = new Date(ts);
+    const pad = (n) => String(n).padStart(2, '0');
+    const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    return new Date().toDateString() === d.toDateString() ? hm : `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+  }
+
+  function renderLog() {
+    const list = $('log-list');
+    const empty = $('log-empty');
+    if (!list) return;
+    if (!state.log.length) {
+      list.replaceChildren();
+      if (empty) empty.hidden = false;
+      return;
+    }
+    if (empty) empty.hidden = true;
+    list.replaceChildren(
+      ...state.log.map((item) =>
+        el(
+          'li',
+          { class: item.ok === false ? 'is-err' : '' },
+          el('span', { class: 'time', text: logTime(item.ts), title: new Date(item.ts).toLocaleString() }),
+          el('span', { class: 'kind', text: LOG_LABEL[item.kind] || item.kind }),
+          el('span', { class: 'text', text: item.text })
+        )
+      )
+    );
   }
 
   function renderHistory() {
@@ -509,14 +590,14 @@
             {
               class: 'chip',
               type: 'button',
-              title: h.pwd ? '点击重新查询' : '上次未找到',
+              title: h.found ? '点击重新查询' : '上次未找到',
               onclick: () => {
                 $('md5-input').value = h.md5;
                 switchMode('md5');
                 runQuery(h.md5);
               },
             },
-            el('span', { class: 'dot' + (h.pwd ? '' : ' miss') }),
+            el('span', { class: 'dot' + (h.found ? '' : ' miss') }),
             el('span', { text: h.md5.slice(0, 8) + '…' + h.md5.slice(-4) })
           )
         )
@@ -556,6 +637,7 @@
     const md5 = normalizeInput(raw);
     if (!md5) {
       renderInvalid(`这不像 32 位 MD5：「${String(raw).slice(0, 40)}」`);
+      pushLog('query', `输入不是合法 MD5：${String(raw).slice(0, 40)}`, false);
       return;
     }
     if (state.busy) return;
@@ -565,13 +647,20 @@
       const res = await lookup(md5);
       if (res.pwd) {
         renderHit(md5, res.pwd, res.from);
-        if (record) pushHistory(md5, res.pwd);
+        if (record) {
+          pushHistory(md5, true);
+          pushLog('query', `${shortMd5(md5)} 命中（${res.from || '本地库'}）`, true);
+        }
       } else {
         renderMiss(md5);
-        if (record) pushHistory(md5, null);
+        if (record) {
+          pushHistory(md5, false);
+          pushLog('query', `${shortMd5(md5)} 未找到`, false);
+        }
       }
     } catch (err) {
       renderError(err);
+      pushLog('query', `${shortMd5(md5)} 查询出错：${(err && (err.message || err)) || '未知错误'}`, false);
     } finally {
       state.busy = false;
     }
@@ -607,11 +696,12 @@
       }
       const res = await lookup(md5).catch(() => ({ pwd: '', from: '' }));
       rows.push({ input: item, md5, pwd: res.pwd, from: res.from, error: res.pwd ? '' : '未找到' });
-      if (res.pwd) pushHistory(md5, res.pwd);
-      else pushHistory(md5, null);
+      pushHistory(md5, Boolean(res.pwd));
     }
     state.lastBatch = rows;
     renderBatchTable(rows);
+    const hit = rows.filter((r) => r.pwd).length;
+    pushLog('batch', `批量查询 ${rows.length} 条，命中 ${hit} 条`, hit > 0);
   }
 
   function renderBatchTable(rows) {
@@ -689,6 +779,7 @@
       $('md5-input').value = md5;
       $('md5-hint').textContent = `已计算：${md5}`;
       $('md5-hint').classList.remove('warn');
+      pushLog('file', `${file.name}（${formatBytes(file.size)}）→ ${shortMd5(md5)}`, true);
       switchMode('md5');
       await runQuery(md5);
     } catch (err) {
@@ -746,11 +837,13 @@
       const data = await resp.json().catch(() => ({}));
 
       if (resp.status === 202) {
+        pushLog('contrib', `投稿已提交，等待审核${md5raw ? `（${shortMd5(payload.md5)}）` : ''}`, true);
         setHint('已提交 ✅ 待管理员审核通过后即可被查到。');
         pwdInput.value = '';
         md5Input.value = '';
         toast('投稿已提交，等待审核');
       } else if (resp.status === 201) {
+        pushLog('contrib', `投稿已收录${md5raw ? `（${shortMd5(payload.md5)}）` : ''}`, true);
         setHint('已收录 ✅ 现在就能查到这条记录。');
         pwdInput.value = '';
         md5Input.value = '';
@@ -762,13 +855,17 @@
         setHint('这条已经在待审队列里了，稍等管理员处理。');
       } else if (resp.status === 403) {
         setHint('对方没有开放投稿。', true);
+        pushLog('contrib', '投稿被拒绝：对方未开放投稿', false);
       } else if (resp.status === 429) {
         setHint('投稿太频繁了，过一会儿再试。', true);
+        pushLog('contrib', '投稿失败：触发频率限制（429）', false);
       } else {
         setHint(`提交失败：${data.error || 'HTTP ' + resp.status}`, true);
+        pushLog('contrib', `投稿失败：${data.error || 'HTTP ' + resp.status}`, false);
       }
     } catch (err) {
       setHint(`连不上服务端：${(err && err.message) || err}`, true);
+      pushLog('contrib', `投稿失败：连不上服务端（${(err && err.message) || err}）`, false);
     } finally {
       btn.disabled = false;
     }
@@ -866,6 +963,7 @@
 
   function saveSources() {
     lsSet(LS.sources, state.sources);
+    pushLog('settings', `数据源已保存：${state.sources.length} 个（启用 ${activeSources().length} 个）`, true);
   }
 
   function openSettings() {
@@ -1029,7 +1127,15 @@
       state.history = [];
       lsDel(LS.history);
       renderHistory();
+      pushLog('cache', '已清空最近查询', true);
       toast('已清空查询历史');
+    });
+
+    $('btn-clear-log').addEventListener('click', () => {
+      state.log = [];
+      lsDel(LS.log);
+      renderLog();
+      toast('已清空操作记录');
     });
 
     // 数据源
@@ -1069,6 +1175,7 @@
         token: $('server-token').value.trim(),
       };
       lsSet(LS.server, state.server);
+      pushLog('settings', `服务端已设置：${state.server.url || '（空）'}`, true);
     };
     $('server-url').addEventListener('change', saveServer);
     $('server-token').addEventListener('change', saveServer);
@@ -1081,11 +1188,15 @@
       state.meta = null;
       renderCacheInfo();
       $('db-meta').textContent = '缓存已清除，下次查询会重新拉取。';
+      pushLog('cache', '已清除本地密码库缓存', true);
       toast('已清除本地缓存');
     });
 
     // 网络状态
-    window.addEventListener('online', updateNetBadge);
+    window.addEventListener('online', () => {
+      updateNetBadge();
+      refreshDb().catch(() => {});
+    });
     window.addEventListener('offline', updateNetBadge);
 
     // 快捷键
@@ -1112,6 +1223,22 @@
   // ------------------------------------------------------------------
   // Service Worker
   // ------------------------------------------------------------------
+  function normalizeHistory(raw) {
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .filter((h) => h && typeof h.md5 === 'string')
+      .map((h) => ({ md5: h.md5, found: Boolean(h.found || h.pwd), ts: Number(h.ts) || Date.now() }))
+      .slice(0, HISTORY_MAX);
+  }
+
+  function normalizeLog(raw) {
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .filter((l) => l && typeof l.text === 'string')
+      .map((l) => ({ ts: Number(l.ts) || Date.now(), kind: l.kind || 'query', text: l.text, ok: l.ok !== false }))
+      .slice(0, LOG_MAX);
+  }
+
   function registerSW() {
     if (!('serviceWorker' in navigator)) return;
     if (location.protocol !== 'http:' && location.protocol !== 'https:') return;
@@ -1136,26 +1263,25 @@
       savedServer && (savedServer.url || savedServer.token)
         ? savedServer
         : { url: DEFAULT_SERVER_URL || '', token: '' };
-    state.history = lsGet(LS.history, []) || [];
+    state.history = normalizeHistory(lsGet(LS.history, []));
+    state.log = normalizeLog(lsGet(LS.log, []));
 
     bindEvents();
     renderHistory();
+    renderLog();
     renderSources();
     updateNetBadge();
 
-    // 先用缓存秒开，再后台刷新
+    // 缓存先秒开，然后**每次打开都自动重新拉取数据源**（不再等 6 小时 TTL）
     const hasCache = loadCacheFirst();
-    if (hasCache) {
-      renderMeta();
-      if (!cacheIsFresh()) {
-        refreshDb({ force: true }).catch(() => {
-          /* 刷新失败就继续用缓存 */
-        });
-      }
-    } else {
-      try {
-        await refreshDb();
-      } catch (err) {
+    if (hasCache) renderMeta();
+    try {
+      await refreshDb();
+    } catch (err) {
+      if (hasCache) {
+        renderMeta('（已回退到本地缓存）');
+        toast('密码库刷新失败，先用本地缓存', 'err');
+      } else {
         renderError(err);
       }
     }

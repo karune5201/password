@@ -14,7 +14,7 @@ passwords_pretty.json
 .DS_Store
 .idea/
 .vscode/
-node_modules/
+node_modules
 worker/node_modules/
 dist/
 .wrangler/
