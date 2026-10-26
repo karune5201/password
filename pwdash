@@ -1,0 +1,19 @@
+#!/bin/sh
+# pwdash —— 命令行快速入口（等价于 python3 cli/pwdkit.py "$@"）
+#
+#   ./pwdash query 619293e69a6b5a90be2c04a6e3bf4715
+#   ./pwdash extract 文件.7z
+#   ./pwdash            # 进交互菜单
+set -e
+DIR=$(cd "$(dirname "$0")" && pwd)
+if [ -n "$PYTHON" ]; then
+  PY=$PYTHON
+elif command -v python3 >/dev/null 2>&1; then
+  PY=python3
+else
+  PY=python
+fi
+if [ $# -eq 0 ]; then
+  exec "$PY" "$DIR/cli/pwdkit.py" menu
+fi
+exec "$PY" "$DIR/cli/pwdkit.py" "$@"

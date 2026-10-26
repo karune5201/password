@@ -1,18 +1,161 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>MD5密码查询</title>
-<link rel="stylesheet" href="style.css">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>密码查询 · pwdash</title>
+<meta name="description" content="按文件 MD5 查询压缩包解压密码，支持拖入文件、批量查询与离线使用。">
+<meta name="theme-color" content="#0b0f14">
+<link rel="manifest" href="./manifest.webmanifest">
+<link rel="icon" href="./assets/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="./assets/icon-192.png">
+<link rel="stylesheet" href="./assets/app.css">
 </head>
 <body>
-<div class="container">
-    <h1>🔑 MD5密码查询</h1>
-    <input type="text" id="md5-input" placeholder="请输入文件 MD5">
-    <button id="query-btn">查询密码</button>
-    <div id="result"></div>
-</div>
-<script src="script.js"></script>
+<div class="bg" aria-hidden="true"><span class="blob blob-a"></span><span class="blob blob-b"></span></div>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">🔑</span>
+    <span class="brand-text">密码查询<em>pwdash</em></span>
+  </div>
+  <div class="topbar-actions">
+    <span class="badge" id="net-badge" hidden>离线</span>
+    <button class="icon-btn" id="btn-theme" type="button" title="切换主题（T）" aria-label="切换主题">🌙</button>
+    <button class="icon-btn" id="btn-settings" type="button" title="设置" aria-label="设置">⚙️</button>
+  </div>
+</header>
+
+<main class="layout">
+  <!-- 查询区 -->
+  <section class="card card-main" id="query-card">
+    <div class="tabs" role="tablist" aria-label="查询方式">
+      <button class="tab is-active" role="tab" data-mode="md5" aria-selected="true">按 MD5</button>
+      <button class="tab" role="tab" data-mode="file" aria-selected="false">拖入文件</button>
+      <button class="tab" role="tab" data-mode="batch" aria-selected="false">批量</button>
+    </div>
+
+    <div class="panel" id="panel-md5" role="tabpanel">
+      <div class="field">
+        <label class="field-label" for="md5-input">文件 MD5</label>
+        <div class="input-wrap">
+          <input id="md5-input" type="text" inputmode="text" autocomplete="off" autocapitalize="off"
+                 spellcheck="false" maxlength="64" placeholder="粘贴 32 位 MD5，自动识别并查询">
+          <button class="input-clear" id="btn-clear" type="button" title="清空" aria-label="清空输入">✕</button>
+        </div>
+        <p class="field-hint" id="md5-hint">支持带空格或大写的 MD5，会自动规范化。</p>
+      </div>
+      <div class="row">
+        <button class="btn primary" id="btn-query" type="button">查询密码</button>
+        <button class="btn ghost" id="btn-paste" type="button">粘贴</button>
+      </div>
+    </div>
+
+    <div class="panel hidden" id="panel-file" role="tabpanel">
+      <div class="dropzone" id="dropzone" tabindex="0" role="button"
+           aria-label="拖入压缩包或点击选择文件">
+        <div class="dz-icon">📦</div>
+        <p class="dz-title">把压缩包拖进来</p>
+        <p class="dz-sub">或 <span class="link">点击选择文件</span> · 支持 7z / zip / rar</p>
+        <p class="dz-note">MD5 在本地计算，文件不会上传</p>
+        <input type="file" id="file-input" hidden>
+      </div>
+      <div class="progress hidden" id="file-progress">
+        <div class="progress-bar"><i></i></div>
+        <span class="progress-text">0%</span>
+      </div>
+      <p class="field-hint" id="file-name"></p>
+    </div>
+
+    <div class="panel hidden" id="panel-batch" role="tabpanel">
+      <div class="field">
+        <label class="field-label" for="batch-input">批量 MD5</label>
+        <textarea id="batch-input" rows="6" spellcheck="false"
+                  placeholder="每行一个 MD5，也可以用空格或逗号分隔"></textarea>
+      </div>
+      <div class="row">
+        <button class="btn primary" id="btn-batch-query" type="button">批量查询</button>
+        <button class="btn ghost" id="btn-batch-copy" type="button">复制全部结果</button>
+      </div>
+    </div>
+
+    <div class="result" id="result" aria-live="polite" aria-atomic="true"></div>
+  </section>
+
+  <!-- 最近查询 -->
+  <section class="card" id="history-card">
+    <div class="card-head">
+      <h2>最近查询</h2>
+      <button class="link" id="btn-clear-history" type="button">清空</button>
+    </div>
+    <ul class="chips" id="history-list"></ul>
+    <p class="empty" id="history-empty">还没有查询记录</p>
+  </section>
+
+  <!-- 数据源 -->
+  <section class="card" id="status-card">
+    <div class="card-head">
+      <h2>数据源</h2>
+      <button class="link" id="btn-refresh" type="button">刷新密码库</button>
+    </div>
+    <ul class="sources" id="source-list"></ul>
+    <p class="meta" id="db-meta">正在加载…</p>
+  </section>
+</main>
+
+<footer class="footer">
+  <span>本地优先 · 离线可用 · 不做任何埋点</span>
+</footer>
+
+<!-- 设置 -->
+<dialog id="settings" class="dialog" aria-labelledby="settings-title">
+  <form method="dialog" class="dialog-inner">
+    <div class="card-head">
+      <h2 id="settings-title">设置</h2>
+      <button class="icon-btn" value="close" type="submit" aria-label="关闭">✕</button>
+    </div>
+
+    <section class="dialog-section">
+      <h3>数据源</h3>
+      <p class="hint">按顺序尝试，第一个命中的结果胜出。可增删、上下调整优先级。</p>
+      <ul class="source-edit" id="source-edit"></ul>
+      <div class="row tight">
+        <input id="new-source-name" type="text" placeholder="名称，如 我的镜像">
+        <input id="new-source-url" type="url" placeholder="https://…/passwords_local.json">
+        <button class="btn ghost" id="btn-add-source" type="button">添加</button>
+      </div>
+    </section>
+
+    <section class="dialog-section">
+      <h3>私有服务端（可选）</h3>
+      <p class="hint">库里查不到时，会再问你自建的 pwdash 服务（见 server/server.py）。</p>
+      <div class="row tight">
+        <input id="server-url" type="url" placeholder="http://127.0.0.1:5000">
+        <input id="server-token" type="password" placeholder="token（可留空）" autocomplete="off">
+      </div>
+    </section>
+
+    <section class="dialog-section">
+      <h3>本地与离线</h3>
+      <p class="hint" id="cache-info">—</p>
+      <div class="row tight">
+        <button class="btn ghost" id="btn-import" type="button">导入本地库</button>
+        <button class="btn ghost" id="btn-export" type="button">导出当前库</button>
+        <button class="btn danger" id="btn-clear-cache" type="button">清除缓存</button>
+        <input type="file" id="import-input" accept=".json,.gz,application/json" hidden>
+      </div>
+    </section>
+
+    <div class="row end">
+      <button class="btn primary" value="close" type="submit">完成</button>
+    </div>
+  </form>
+</dialog>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script src="./assets/md5.js"></script>
+<script src="./assets/app.js"></script>
 </body>
 </html>

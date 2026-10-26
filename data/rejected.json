@@ -1,0 +1,12 @@
+[
+  {
+    "md5": "93be1fa6d52526a9aef8d2e82c0f",
+    "password": "老王爱学习",
+    "reason": "key 不是 32 位 MD5"
+  },
+  {
+    "md5": "7e9b41a8a44a76bf63f0a89e8d1b",
+    "password": "萤火之森",
+    "reason": "key 不是 32 位 MD5"
+  }
+]
