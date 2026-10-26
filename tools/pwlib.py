@@ -28,7 +28,7 @@ DB_NAME = "passwords_local.json.gz"
 # 内置默认数据源（网页端与 CLI 共用一份语义：
 # 依次尝试，第一个命中的结果胜出）
 DEFAULT_SOURCES = [
-    "https://raw.githubusercontent.com/Karune-SHI-E/1111/master/passwords_local.json",
+    "https://raw.githubusercontent.com/karune5201/password/master/passwords_local.json",
 ]
 
 

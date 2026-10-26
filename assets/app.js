@@ -27,22 +27,26 @@
 
   // 部署 Cloudflare Worker 后把地址填在这里，前端首次打开就会自动用它
   // 例：'https://pwdash.your-name.workers.dev'
-  const DEFAULT_SERVER_URL = '';
+  const GH_RAW = 'https://raw.githubusercontent.com/karune5201/password/master';
+
+  // 本地部署（tools/serve.py 打开的 localhost）自动改用同目录的库文件 + 本机服务端，
+  // 线上（GitHub Pages / Cloudflare Pages）仍然走 GitHub raw + Worker。
+  // 本机服务端地址可用 ?server=http://127.0.0.1:5000 覆盖。
+  const IS_LOCAL = /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname);
+  const LOCAL_SERVER = new URLSearchParams(location.search).get('server') || 'http://127.0.0.1:5000';
+  const DEFAULT_SERVER_URL = IS_LOCAL ? LOCAL_SERVER : '';
 
   // 多个库按顺序合并，靠前的优先。
   // 想把自己的库和「陌生人投稿库」分开，就再加一条 community 的地址。
-  const DEFAULT_SOURCES = [
-    {
-      name: '我的库',
-      url: 'https://raw.githubusercontent.com/Karune-SHI-E/1111/master/passwords_local.json',
-      enabled: true,
-    },
-    {
-      name: '投稿库',
-      url: 'https://raw.githubusercontent.com/Karune-SHI-E/1111/master/community_passwords.json',
-      enabled: true,
-    },
-  ];
+  const DEFAULT_SOURCES = IS_LOCAL
+    ? [
+        { name: '我的库', url: './passwords_local.json', enabled: true },
+        { name: '投稿库', url: './community_passwords.json', enabled: true },
+      ]
+    : [
+        { name: '我的库', url: `${GH_RAW}/passwords_local.json`, enabled: true },
+        { name: '投稿库', url: `${GH_RAW}/community_passwords.json`, enabled: true },
+      ];
 
   // ------------------------------------------------------------------
   // 状态

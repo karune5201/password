@@ -7,7 +7,7 @@
  *
  * 改完前端记得把 VERSION 加一，否则老用户会继续用旧缓存。
  */
-const VERSION = 'v3-2026-02';
+const VERSION = 'v3-2026-02-local';
 const SHELL_CACHE = `pwdash-shell-${VERSION}`;
 const DATA_CACHE = `pwdash-data-${VERSION}`;
 

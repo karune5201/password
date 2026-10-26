@@ -19,3 +19,8 @@ worker/node_modules/
 dist/
 .wrangler/
 .dev.vars
+
+# 本地部署产物
+logs/
+.local-token
+pending_uploads.json.gz

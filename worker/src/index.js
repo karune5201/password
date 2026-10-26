@@ -20,7 +20,7 @@
  *   GET  /admin?token=xxx       管理页面（手机也能点）
  *
  * 环境变量
- *   GH_OWNER / GH_REPO / GH_BRANCH / GH_PATH   仓库坐标，默认 Karune-SHI-E / 1111 / master / passwords_local.json
+ *   GH_OWNER / GH_REPO / GH_BRANCH / GH_PATH   仓库坐标，默认 karune5201 / password / master / passwords_local.json
  *   CORS_ORIGIN                                允许的来源，默认 *
  *   CONTRIB_MODE                               queue | auto | off，默认 queue
  *   CONTRIB_LIMIT                              每 IP 每小时投稿上限，默认 10
@@ -59,8 +59,8 @@ function cfg(env) {
   const names = dbs.map((d) => d.name);
   const contribDb = env.CONTRIB_DB || (names.includes('community') ? 'community' : names[names.length - 1]);
   return {
-    owner: env.GH_OWNER || 'Karune-SHI-E',
-    repo: env.GH_REPO || '1111',
+    owner: env.GH_OWNER || 'karune5201',
+    repo: env.GH_REPO || 'password',
     branch: env.GH_BRANCH || 'master',
     dbs,
     names,

@@ -531,6 +531,22 @@ const DEFAULT_SERVER_URL = 'https://pwdash.<你的账号>.workers.dev';
 
 **没有服务器也能跑后端**：见上面 [全托管部署](#全托管部署github--cloudflare-workers--pages)。
 
+### 本地一键部署（自己机器上预览 / 自用）
+
+```bash
+./start-local.sh                 # 静态前端 127.0.0.1:8080 + 查询服务 127.0.0.1:5000
+WEB_PORT=9000 API_PORT=5001 ./start-local.sh
+BIND=0.0.0.0 ./start-local.sh    # 局域网 / 手机同网段访问
+./start-local.sh status|stop|restart
+```
+
+- 打开 <http://127.0.0.1:8080/> 就是网页版；在 `localhost / 127.0.0.1` 下页面会**自动改用同目录的
+  `passwords_local.json` + `community_passwords.json` 与本机服务端**，不依赖 GitHub raw，断网可用；
+  线上域名（GitHub Pages / Cloudflare Pages）仍然走 GitHub raw + Worker，行为不变
+- 本机服务端地址可临时覆盖：`?server=http://127.0.0.1:5001`
+- 审核口令首次运行生成在 `.local-token`（勿外传），日志在 `logs/{web,api}.log`
+- 只要静态预览：`python3 tools/serve.py`（不带后端也能查库，仅投稿页签不可用）
+
 ---
 
 ## 安全与隐私

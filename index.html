@@ -88,9 +88,9 @@
                placeholder="填完整密码，提交后由管理员审核">
       </div>
       <div class="field">
-        <label class="field-label" for="contrib-md5">对应文件 MD5（可留空，默认按密码反算）</label>
+        <label class="field-label" for="contrib-md5">对应文件 MD5</label>
         <input id="contrib-md5" type="text" autocomplete="off" spellcheck="false" maxlength="64"
-               placeholder="32 位 MD5，留空则由服务端按密码计算">
+               placeholder="32 位 MD5">
       </div>
       <div class="row">
         <button class="btn primary" id="btn-contrib" type="button">提交投稿</button>
@@ -138,7 +138,7 @@
 
     <section class="dialog-section">
       <h3>数据源</h3>
-      <p class="hint">按顺序尝试，第一个命中的结果胜出。可增删、上下调整优先级。</p>
+      <p class="hint">按顺序尝试，可增删、上下调整优先级。</p>
       <p class="hint">多个库按顺序合并：<b>靠前的库优先</b>，同一个 MD5 出现在两个库里时用靠前那个。
         常见做法是「自己的库」放第一条，「陌生人投稿库」放第二条，两者互不污染。</p>
       <ul class="source-edit" id="source-edit"></ul>
