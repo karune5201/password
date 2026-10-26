@@ -96,6 +96,7 @@ password/
 ├── tools/
 │   ├── pwlib.py            # 库读写层（原子写入 + 文件锁）
 │   ├── build_db.py         # 库构建/清洗（体检、去脏数据、生成 gz 与 JSON）
+│   ├── db_index.py         # 扫描目录生成 dbs.json 多库清单
 │   ├── make_icons.py       # 生成 PWA 图标
 │   ├── serve.py            # 本地预览静态服务
 │   └── git-menu.sh         # 通用 git 操作菜单（原 1.sh）
@@ -104,6 +105,7 @@ password/
 │   ├── dom_test.mjs        # jsdom 跑真实 app.js（35 项）
 │   ├── reload_test.mjs     # 刷新自动加载 + 操作记录持久化（23 项）
 │   └── web_test.mjs        # 无头 Chrome 端到端（CDP，无需 puppeteer）
+├── dbs.json                # 多库清单：这个目录里有哪些库、谁优先（网页/服务端/CLI 都读它）
 ├── passwords_local.json    # 网页版明文库（发到 GitHub 供前端 fetch）
 ├── passwords_local.json.gz # 命令行用压缩库
 ├── community_passwords.json # 陌生人投稿库（审核通过后写入；初始为 {}）
@@ -223,7 +225,8 @@ export PWDASH_TOKEN=换个长口令
 | `doctor` | 环境体检 |
 | `menu` | 交互菜单 |
 
-全局参数：`-d/--db` 指定库文件、`--server` 指定服务端、`--token` 指定令牌（或环境变量 `PWDASH_DB` / `PWDASH_SERVER` / `PWDASH_TOKEN`）。
+全局参数：`-d/--db` 指定库文件、`--db-dir` 指定多库目录（等价环境变量 `PWDASH_DB_DIR`）、
+`--server` 指定服务端、`--token` 指定令牌（或环境变量 `PWDASH_DB` / `PWDASH_SERVER` / `PWDASH_TOKEN`）。
 
 ---
 
@@ -248,17 +251,64 @@ python3 tools/build_db.py --report data/rejected.json           # 导出被剔�
 
 ---
 
-## 多库：自己的库 / 陌生人的库
+## 多库：一个目录放多个库
 
 投稿一旦开放，就不该和主库混在一起——别人塞进来的字符串会直接改变你的查询结果。
 所以库是**可以拆成多个**的：各自独立文件、独立审核、查询时按顺序合并。
+
+更一般地：**一个目录下可以放任意多个库**，由目录里的 `dbs.json` 声明「有哪几个库、谁优先」。
+网页端、服务端、CLI 读的都是同一份清单，行为一致。
+
+### 清单长什么样
+
+```json
+{
+  "version": 1,
+  "dbs": [
+    { "name": "主库",   "file": "passwords_local.json" },
+    { "name": "投稿库", "file": "community_passwords.json" },
+    { "name": "朋友库", "file": "friends.json", "enabled": false }
+  ]
+}
+```
+
+- 数组顺序 = **查询优先级**：同一个 MD5 出现在多个库时，用靠前那个；
+- `file` 相对清单所在目录，也可以写完整 URL；`enabled: false` 临时停用某个库而不删条目；
+- 清单里没列到的库文件也不会漏——按文件名排序追加到末尾；
+- `x.json` 与 `x.json.gz` 视为同一个库，只算一份。
+
+生成 / 更新清单（扫描目录，保留你已改过的名字和顺序）：
+
+```bash
+python3 tools/db_index.py               # 扫描仓库根目录，写 dbs.json
+python3 tools/db_index.py dbs/          # 扫描指定目录
+python3 tools/db_index.py dbs/ --check  # 只体检，不写文件
+```
+
+### 三个入口怎么读多库
+
+| 入口 | 用法 | 说明 |
+| --- | --- | --- |
+| 网页 | 数据源填 `…/dbs.json` | 读清单后按顺序把目录里所有库拉下来合并；也可以直接填单个库文件地址 |
+| 服务端 | `python3 server/server.py --db-dir .` | 扫描目录（按 `dbs.json` 顺序），`GET /health` 会列出每个库的条数 |
+| 命令行 | `./pwdash --db-dir . query <md5>` | 只读多库视图：查询/列表/统计/导出跨库合并；**写入要用 `-d` 指定具体库文件** |
+
+- 服务端优先级：`--db-dir` > `--dbs` > `--db` > 默认库；`--dbs "own=a.json.gz,public=b.json.gz"` 也可用；
+- CLI 在多库视图下写入会直接报错退出（码 3），提示改用 `-d`，避免把记录写进不该写的库；
+- `./start-local.sh` 起服务端时用的就是 `--db-dir .`，所以往目录里丢新的库文件再刷新页面就能看到。
+
+### 界面上库名就是仓库名
+
+数据源卡片显示仓库名（默认 `karune5201/password`），后面跟清单里的库名与条数，
+例如 `✓ karune5201/password　优先　主库 · 83 条`。换仓库就改 `assets/app.js` 顶部的
+`GH_RAW` 和 `REPO_NAME` 两行。
 
 ### 默认布局
 
 | 库名 | 文件 | 谁的 | 说明 |
 | --- | --- | --- | --- |
-| `main` | `passwords_local.json` | 你的 | 你自己维护，优先级最高 |
-| `community` | `community_passwords.json` | 陌生人的 | 投稿先落这里，审核通过才生效 |
+| `主库`（服务端内部名 `main`） | `passwords_local.json` | 你的 | 你自己维护，优先级最高 |
+| `投稿库`（服务端内部名 `community`） | `community_passwords.json` | 陌生人的 | 投稿先落这里，审核通过才生效 |
 
 查询规则：**先查 `main`，再查 `community`**；同一个 MD5 两个库都有时用 `main` 的值。
 任何一个库里已有这条记录，投稿接口就直接回 `exists`，不会重复堆。
@@ -294,16 +344,17 @@ CONTRIB_DB = "community"
 
 ### 网页怎么用多库
 
-设置 → 数据源，按优先级列出来即可：
+默认就一条数据源：仓库里的 `dbs.json` 清单。页面打开后自动读清单，把清单里的库**全部**拉下来合并：
 
-1. `我的库` → `.../passwords_local.json`
-2. `投稿库` → `.../community_passwords.json`
+```
+✓ karune5201/password   优先    主库 · 83 条
+✓ karune5201/password   第 2 库  投稿库 · 0 条
+```
 
-页面会合并两个库，并在「库信息」显示「2 个库合并」；设置里每个源后面标着「优先 / 第 2 库」。
-某一条命中时，结果里会注明它来自哪个库。
-
-> 投稿库暂时是空的（`{}`）也没关系：那个源会显示 ✕，主库照常可用；
-> 等有人投稿并通过审核，它就有内容了。
+- 「库信息」会显示「2 个库合并（karune5201/password）」，某条命中时结果里标明来自哪个库；
+- 想加库：把库文件丢进仓库（比如 `friends.json`）→ `python3 tools/db_index.py` 更新清单 → 刷新页面；
+- 也可以绕开清单：设置 → 数据源里直接填 `.../some.json` 单库地址，两种混用都行；
+- 投稿库暂时是空的（`{}`）也没关系，它显示 0 条，主库照常可用。
 
 ---
 

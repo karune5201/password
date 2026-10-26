@@ -605,6 +605,11 @@ def main(argv: "list[str] | None" = None) -> int:
         help="多库配置：'main=passwords_local.json.gz,community=community.json.gz'；靠前的库优先",
     )
     ap.add_argument(
+        "--db-dir",
+        default=os.environ.get("PWDASH_DB_DIR", ""),
+        help="多库目录：扫描该目录下所有库文件（按 dbs.json 清单顺序），一个目录可放多个库",
+    )
+    ap.add_argument(
         "--contrib-db",
         default=os.environ.get("PWDASH_CONTRIB_DB", "community"),
         help="陌生人投稿默认写入哪个库（默认 community，不存在则用最后一个库）",
@@ -631,7 +636,14 @@ def main(argv: "list[str] | None" = None) -> int:
         return 2
 
     db_list = parse_dbs(args.dbs)
-    primary = args.db or pwlib.default_db_path()
+    if args.db_dir:
+        try:
+            db_list = pwlib.scan_db_dir(args.db_dir)
+        except pwlib.DBError as exc:
+            print(f"❌ 扫描多库目录失败: {exc}", file=sys.stderr)
+            return 3
+        print(f"📂 多库目录 {os.path.abspath(args.db_dir)}：{', '.join(n for n, _ in db_list)}")
+    primary = args.db or (db_list[0][1] if db_list else pwlib.default_db_path())
     if not db_list:
         # 单库时也给出约定：主库 + 同目录的 community 库（自动创建）
         base_dir = os.path.dirname(os.path.abspath(primary)) or "."
@@ -651,10 +663,17 @@ def main(argv: "list[str] | None" = None) -> int:
         dbs=db_list or None,
         contrib_db=args.contrib_db,
     )
-    store = pwlib.Store(args.db)
     print(f"🚀 pwdash {VERSION} 已启动 → http://{args.bind}:{args.port}", flush=True)
-    print(f"📚 数据库: {store.path}（{len(store.load())} 条）")
-    print(f"📝 投稿模式: {args.contrib_mode}（待审 {len(httpd.RequestHandlerClass.app.pending.load())} 条）")
+    for name, path in db_list:
+        try:
+            count = len(pwlib.Store(path).load())
+        except pwlib.DBError as exc:
+            count = f"读取失败: {exc}"
+        print(f"📚 {name:<12} {path}（{count} 条）", flush=True)
+    print(
+        f"📝 投稿模式: {args.contrib_mode}（待审 {len(httpd.RequestHandlerClass.app.pending.load())} 条）",
+        flush=True,
+    )
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

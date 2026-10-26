@@ -51,6 +51,20 @@ EXIT_OK, EXIT_USAGE, EXIT_DB, EXIT_NOTFOUND, EXIT_EXTRACT, EXIT_DEPS, EXIT_NET =
 DEFAULT_SERVER = os.environ.get("PWDASH_SERVER", "http://127.0.0.1:5000")
 
 
+def open_store(args: argparse.Namespace):
+    """按 --db / --db-dir 打开库。
+
+    * --db-dir（或环境变量 PWDASH_DB_DIR）→ 只读多库视图，查询跨库合并、靠前优先；
+    * 否则 → 单个库文件。
+
+    多库视图下写入会抛出 DBError，提示改用 -d 指定具体库文件，避免污染。
+    """
+    db_dir = getattr(args, "db_dir", None) or os.environ.get("PWDASH_DB_DIR") or ""
+    if db_dir:
+        return pwlib.MultiStore.from_dir(db_dir)
+    return pwlib.Store(getattr(args, "db", None))
+
+
 # --------------------------------------------------------------------------
 # 输出小工具
 # --------------------------------------------------------------------------
@@ -193,7 +207,7 @@ def _lookup(store: "pwlib.Store", md5: str, args: argparse.Namespace) -> "str | 
 
 
 def cmd_query(args: argparse.Namespace) -> int:
-    store = pwlib.Store(args.db)
+    store = open_store(args)
 
     targets: "list[str]" = []
     if args.file:
@@ -244,7 +258,7 @@ def cmd_query(args: argparse.Namespace) -> int:
 
 
 def cmd_add(args: argparse.Namespace) -> int:
-    store = pwlib.Store(args.db)
+    store = open_store(args)
     md5 = args.md5
     pwd = args.password
 
@@ -284,7 +298,7 @@ def cmd_add(args: argparse.Namespace) -> int:
 
 
 def cmd_remove(args: argparse.Namespace) -> int:
-    store = pwlib.Store(args.db)
+    store = open_store(args)
     missing = 0
     for raw in args.md5:
         try:
@@ -300,7 +314,7 @@ def cmd_remove(args: argparse.Namespace) -> int:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    store = pwlib.Store(args.db)
+    store = open_store(args)
     data = store.load()
     rows = sorted(data.items())
     if args.search:
@@ -327,7 +341,7 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def cmd_stats(args: argparse.Namespace) -> int:
-    store = pwlib.Store(args.db)
+    store = open_store(args)
     try:
         stats = store.stats()
     except pwlib.DBError as exc:
@@ -336,9 +350,20 @@ def cmd_stats(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(stats, ensure_ascii=False, indent=2))
     else:
-        print(f"📚 库文件: {stats['path']}")
-        print(f"   记录数: {stats['entries']}")
-        print(f"   体积:   {stats['compressed_bytes']} 字节")
+        if stats.get("multi"):
+            print(f"📂 多库目录: {stats['path']}（{len(stats['dbs'])} 个库）")
+            for i, row in enumerate(stats["dbs"]):
+                tag = "优先" if i == 0 else f"第 {i + 1} 库"
+                err = f"   ⚠️ {row['error']}" if row.get("error") else ""
+                print(
+                    f"   · {row['name']:<14} {row['entries']:>6} 条  "
+                    f"{os.path.basename(row.get('path', ''))}  [{tag}]{err}"
+                )
+            print(f"   合并后记录数: {stats['entries']}")
+        else:
+            print(f"📚 库文件: {stats['path']}")
+            print(f"   记录数: {stats['entries']}")
+            print(f"   体积:   {stats['compressed_bytes']} 字节")
         print(f"   密码长度: 平均 {stats['avg_password_len']} / 最长 {stats['max_password_len']}")
         if stats["invalid_keys"]:
             warn(f"发现 {len(stats['invalid_keys'])} 条非法 key：{stats['invalid_keys'][:5]}")
@@ -348,7 +373,7 @@ def cmd_stats(args: argparse.Namespace) -> int:
 
 
 def cmd_export(args: argparse.Namespace) -> int:
-    store = pwlib.Store(args.db)
+    store = open_store(args)
     try:
         data = store.load()
     except pwlib.DBError as exc:
@@ -378,7 +403,7 @@ def cmd_export(args: argparse.Namespace) -> int:
 
 
 def cmd_import(args: argparse.Namespace) -> int:
-    store = pwlib.Store(args.db)
+    store = open_store(args)
     if not os.path.exists(args.file):
         fail(f"文件不存在: {args.file}")
         return EXIT_USAGE
@@ -397,7 +422,7 @@ def cmd_import(args: argparse.Namespace) -> int:
 
 
 def cmd_extract(args: argparse.Namespace) -> int:
-    store = pwlib.Store(args.db)
+    store = open_store(args)
     path = args.archive
     if not os.path.exists(path):
         fail(f"文件不存在: {path}")
@@ -463,7 +488,7 @@ def cmd_extract(args: argparse.Namespace) -> int:
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
-    store = pwlib.Store(args.db)
+    store = open_store(args)
     server = args.server or DEFAULT_SERVER
     token = args.token or os.environ.get("PWDASH_TOKEN", "")
 
@@ -604,8 +629,18 @@ def cmd_review(args: argparse.Namespace) -> int:
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     print(f"🧬 Python {sys.version.split()[0]} / {sys.platform}")
-    print(f"📚 库路径: {pwlib.default_db_path()}")
-    store = pwlib.Store(args.db)
+    db_dir = getattr(args, "db_dir", None) or os.environ.get("PWDASH_DB_DIR") or ""
+    if db_dir:
+        print(f"📂 多库目录: {os.path.abspath(db_dir)}")
+        try:
+            for i, (name, path) in enumerate(pwlib.scan_db_dir(db_dir)):
+                tag = "优先" if i == 0 else f"第 {i + 1} 库"
+                print(f"   · {name:<14} {path}  [{tag}]")
+        except pwlib.DBError as exc:
+            warn(str(exc))
+    else:
+        print(f"📚 库路径: {pwlib.default_db_path()}")
+    store = open_store(args)
     try:
         stats = store.stats()
         print(f"   记录 {stats['entries']} 条，非法 key {len(stats['invalid_keys'])} 条")
@@ -634,7 +669,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 # 交互菜单（兼容老 1.py 的使用习惯）
 # --------------------------------------------------------------------------
 def cmd_menu(args: argparse.Namespace) -> int:
-    store = pwlib.Store(args.db)
+    store = open_store(args)
     while True:
         print(f"\n{C.BLUE}==== 🔑 pwdkit 密码工具 ===={C.RESET}")
         print(f" 库: {store.path}  ({len(store.load())} 条)")
@@ -654,6 +689,7 @@ def cmd_menu(args: argparse.Namespace) -> int:
                 continue
             ns = argparse.Namespace(
                 db=args.db,
+                db_dir=getattr(args, "db_dir", None),
                 archive=path,
                 password="",
                 no_db=False,
@@ -672,6 +708,7 @@ def cmd_menu(args: argparse.Namespace) -> int:
                 continue
             ns = argparse.Namespace(
                 db=args.db,
+                db_dir=getattr(args, "db_dir", None),
                 md5=[raw],
                 file=raw if os.path.isfile(raw) else "",
                 json=False,
@@ -697,7 +734,7 @@ def cmd_menu(args: argparse.Namespace) -> int:
         elif choice == "4":
             cmd_list(
                 argparse.Namespace(
-                    db=args.db, json=False, reveal=False, limit=0, search=""
+                    db=args.db, db_dir=getattr(args, "db_dir", None), json=False, reveal=False, limit=0, search=""
                 )
             )
         elif choice == "5":
@@ -709,7 +746,7 @@ def cmd_menu(args: argparse.Namespace) -> int:
                 argparse.Namespace(db=args.db, format="json", output="")
             )
         elif choice == "7":
-            cmd_stats(argparse.Namespace(db=args.db, json=False))
+            cmd_stats(argparse.Namespace(db=args.db, db_dir=getattr(args, "db_dir", None), json=False))
         elif choice == "0":
             info("👋 再见")
             return EXIT_OK
@@ -728,6 +765,10 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=__doc__,
     )
     ap.add_argument("-d", "--db", help="数据库路径（默认仓库内 passwords_local.json.gz）")
+    ap.add_argument(
+        "--db-dir",
+        help="多库目录：读出该目录下所有库（按 dbs.json 清单顺序，靠前优先）；多库下写入请改用 -d",
+    )
     ap.add_argument("--server", help=f"远端服务地址（默认 {DEFAULT_SERVER}）")
     ap.add_argument("--token", help="服务端鉴权 token（也可用 PWDASH_TOKEN）")
     ap.add_argument("-V", "--version", action="version", version="pwdkit 2.0")

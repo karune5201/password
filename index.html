@@ -149,12 +149,12 @@
     <section class="dialog-section">
       <h3>数据源</h3>
       <p class="hint">按顺序尝试，可增删、上下调整优先级。</p>
-      <p class="hint">多个库按顺序合并：<b>靠前的库优先</b>，同一个 MD5 出现在两个库里时用靠前那个。
-        常见做法是「自己的库」放第一条，「陌生人投稿库」放第二条，两者互不污染。</p>
+      <p class="hint">填 <b>dbs.json</b> 清单地址（推荐）＝一个目录里的多个库全部读进来，清单里的顺序就是优先级；
+        也可以直接填某个 <code>.json</code> 库文件地址。多个库按顺序合并：<b>靠前的库优先</b>。</p>
       <ul class="source-edit" id="source-edit"></ul>
       <div class="row tight">
-        <input id="new-source-name" type="text" placeholder="名称，如 我的镜像">
-        <input id="new-source-url" type="url" placeholder="https://…/passwords_local.json">
+        <input id="new-source-name" type="text" placeholder="名称，如 karune5201/password">
+        <input id="new-source-url" type="url" placeholder="https://…/dbs.json 或 …/passwords_local.json">
         <button class="btn ghost" id="btn-add-source" type="button">添加</button>
       </div>
     </section>

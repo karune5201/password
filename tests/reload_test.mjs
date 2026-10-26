@@ -72,10 +72,7 @@ const db = JSON.parse(fs.readFileSync(path.join(ROOT, 'passwords_local.json'), '
 const [sampleMd5] = Object.entries(db).filter(([k]) => /^[0-9a-f]{32}$/.test(k))[0];
 
 // ---------------------------------------------------------------- 打开页面
-const SOURCES = [
-  { name: '我的库', url: new URL('passwords_local.json', BASE).href, enabled: true },
-  { name: '投稿库', url: new URL('community_passwords.json', BASE).href, enabled: true },
-];
+// 默认数据源就是仓库根目录的 dbs.json（主库 + 投稿库）
 
 async function openPage(storage, { offline = false } = {}) {
   const vconsole = new VirtualConsole();
@@ -99,9 +96,7 @@ async function openPage(storage, { offline = false } = {}) {
       window.TextEncoder = globalThis.TextEncoder;
       window.Blob = globalThis.Blob;
       for (const [k, v] of Object.entries(storage || {})) window.localStorage.setItem(k, v);
-      if (!window.localStorage.getItem('pwdash.sources.v2')) {
-        window.localStorage.setItem('pwdash.sources.v2', JSON.stringify(SOURCES));
-      }
+      // 不写 sources：走默认配置（本地 = 同目录 dbs.json 清单），顺带验证清单加载
     },
   });
   await waitFor(() => dom.window.document.readyState === 'complete', 8000, 'load');
@@ -115,7 +110,8 @@ let page = await openPage(null);
 const w1 = page.window;
 await waitFor(() => /\d+ 条记录/.test($(w1, 'db-meta').textContent), 8000, '首次加载库');
 check('首屏自动加载库', true, /2 个库合并/.test($(w1, 'db-meta').textContent));
-check('数据源状态已渲染', 2, w1.document.querySelectorAll('#source-list .ok').length);
+check('数据源状态已渲染（清单里的 2 个库）', 2, w1.document.querySelectorAll('#source-list .ok').length);
+check('库名是仓库名', true, /karune5201\/password/.test($(w1, 'source-list').textContent));
 check('确实请求了库文件', true, page.hits() >= 2);
 
 // 查一条 → 产生操作记录

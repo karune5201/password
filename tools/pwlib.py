@@ -83,6 +83,26 @@ def mask(password: str, keep: int = 2) -> str:
 # --------------------------------------------------------------------------
 # 解码 / 编码
 # --------------------------------------------------------------------------
+def loads_any(raw: bytes):
+    """把文件字节流解析成任意 JSON 结构（清单文件用；兼容 gzip/zlib/裸 JSON）。"""
+    text = None
+    for decoder in (gzip.decompress, zlib.decompress):
+        try:
+            text = decoder(raw).decode("utf-8")
+            break
+        except Exception:  # noqa: BLE001 - 换一种解码方式再试
+            continue
+    if text is None:
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise DBError(f"无法解码文件内容: {exc}") from exc
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise DBError(f"不是合法 JSON: {exc}") from exc
+
+
 def loads(raw: bytes) -> "dict[str, str]":
     """把库文件的字节流解析成 {md5: password}，兼容压缩与旧版列表格式。"""
     text = None
@@ -288,3 +308,267 @@ class Store:
                     stats["added"] += 1
             atomic_write(self.path, dumps(data, compress=True))
         return stats
+
+
+# --------------------------------------------------------------------------
+# 多库：一个目录下可以有多个库文件，由 dbs.json 清单声明顺序
+# --------------------------------------------------------------------------
+INDEX_NAME = "dbs.json"
+DB_SUFFIXES = (".json.gz", ".json")
+# 同目录下这些文件不是密码库，扫描时跳过
+NOT_A_DB = {
+    INDEX_NAME,
+    "pending_uploads.json.gz",
+    "pending_uploads.json",
+    "rejected.json",
+    "manifest.webmanifest",
+    "package.json",
+    "package-lock.json",
+    "tsconfig.json",
+    "wrangler.json",
+    "npm-shrinkwrap.json",
+}
+
+
+def is_db_filename(name: str) -> bool:
+    """按文件名判断是不是候选库文件（内容是否合法由 load 校验）。"""
+    if name in NOT_A_DB or name.startswith(".") or name.startswith(".tmp-"):
+        return False
+    return name.endswith(DB_SUFFIXES)
+
+
+def read_index(directory: str) -> "list[dict]":
+    """读目录下的 dbs.json 清单。没有就返回 []。
+
+    清单格式（两种都接受）：
+        {"dbs": [{"name": "主库", "file": "passwords_local.json"}, ...]}
+        [{"name": "主库", "file": "passwords_local.json"}, ...]
+    """
+    path = os.path.join(directory, INDEX_NAME)
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "rb") as fh:
+            data = loads_any(fh.read())
+    except Exception as exc:  # noqa: BLE001
+        raise DBError(f"读取清单失败 {path}: {exc}") from exc
+    items = data.get("dbs") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        raise DBError(f"清单格式不对 {path}: 需要 dbs 数组")
+    out = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        file = item.get("file") or item.get("url") or item.get("path")
+        if not file:
+            continue
+        name = str(item.get("name") or os.path.splitext(os.path.basename(str(file)))[0])
+        out.append({"name": name, "file": str(file), "enabled": item.get("enabled", True) is not False})
+    return out
+
+
+def scan_db_dir(directory: str, *, use_index: bool = True) -> "list[tuple[str, str]]":
+    """扫描目录，返回 [(库名, 路径)]。
+
+    * 有 dbs.json 就按清单顺序（清单里 enabled:false 的跳过）；
+    * 没有清单就按文件名排序，把所有看起来像库的文件都算进去；
+    * 清单之后还有没被列出的库文件，会按文件名追加到末尾（不会漏读）。
+    """
+    directory = os.path.abspath(os.path.expanduser(directory))
+    if not os.path.isdir(directory):
+        raise DBError(f"不是一个目录: {directory}")
+
+    entries: "list[tuple[str, str]]" = []
+    listed = set()    # 已处理过的文件名
+    seen_hashes = set()  # 已处理过的 stem（x.json / x.json.gz 视为同一个库）
+
+    def _same_db(name: str) -> bool:
+        """x.json 与 x.json.gz 是同一份库的两种封装，只算一个。"""
+        key = stem_of(name)
+        if key in seen_hashes:
+            return True
+        seen_hashes.add(key)
+        return False
+
+    if use_index:
+        for item in read_index(directory):
+            base = os.path.basename(item["file"])
+            listed.add(base)
+            if not item["enabled"]:
+                _same_db(base)
+                continue
+            if _same_db(base):
+                continue
+            path = item["file"]
+            if not os.path.isabs(path):
+                path = os.path.join(directory, path)
+            entries.append((item["name"], path))
+
+    extras = []
+    for name in sorted(os.listdir(directory)):
+        if name in listed or not is_db_filename(name) or _same_db(name):
+            continue
+        extras.append((stem_of(name), os.path.join(directory, name)))
+    entries.extend(extras)
+
+    if not entries:
+        raise DBError(f"目录里没有找到库文件: {directory}")
+    return entries
+
+
+def write_index(directory: str, *, path: "str | None" = None) -> "dict":
+    """扫描目录并生成/更新 dbs.json（保留已有条目里的自定义名字与顺序）。"""
+    directory = os.path.abspath(os.path.expanduser(directory))
+    if not os.path.isdir(directory):
+        raise DBError(f"不是一个目录: {directory}")
+
+    old = {os.path.basename(i["file"]): i for i in read_index(directory)}
+    dbs = []
+    seen = set()        # 已收录的文件名
+    seen_stems = set()  # 已收录的 stem：x.json 与 x.json.gz 只算一份
+
+    def take(name: str) -> bool:
+        if name in seen:
+            return False
+        key = stem_of(name)
+        if key in seen_stems:
+            return False
+        seen.add(name)
+        seen_stems.add(key)
+        return True
+
+    for base, item in old.items():
+        full = os.path.join(directory, base)
+        if not os.path.exists(full) or not is_db_filename(base):
+            continue
+        if not take(base):
+            continue
+        dbs.append({"name": item["name"], "file": base})
+    for name in sorted(os.listdir(directory)):
+        if not is_db_filename(name) or not take(name):
+            continue
+        dbs.append({"name": stem_of(name), "file": name})
+
+    payload = {"version": 1, "dbs": dbs}
+    target = path or os.path.join(directory, INDEX_NAME)
+    atomic_write(target, json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8") + b"\n")
+    return payload
+
+
+def stem_of(filename: str) -> str:
+    """passwords_local.json.gz → passwords_local"""
+    base = filename
+    for suffix in (".gz", ".json"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+    return base or filename
+
+
+def load_multi(entries: "list[tuple[str, str]]") -> "tuple[dict[str, str], dict[str, str]]":
+    """按顺序合并多个库，返回 (合并结果, md5 -> 来源库名)。靠前的库优先。"""
+    merged: "dict[str, str]" = {}
+    origin: "dict[str, str]" = {}
+    for name, path in entries:
+        try:
+            with open(path, "rb") as fh:
+                data = loads(fh.read())
+        except Exception as exc:  # noqa: BLE001
+            raise DBError(f"读取 {path} 失败: {exc}") from exc
+        for k, v in data.items():
+            key = str(k).strip().lower()
+            if key in merged:
+                continue
+            merged[key] = v
+            origin[key] = name
+    return merged, origin
+
+
+class MultiStore:
+    """只读的多库视图：查询/统计跨库合并，写入必须指定具体库文件。"""
+
+    def __init__(self, entries: "list[tuple[str, str]]"):
+        if not entries:
+            raise DBError("多库视图至少要有一个库")
+        self.entries = entries
+        self.stores = [(name, Store(path)) for name, path in entries]
+        self.path = os.path.dirname(os.path.abspath(entries[0][1]))
+
+    @classmethod
+    def from_dir(cls, directory: str, *, use_index: bool = True) -> "MultiStore":
+        return cls(scan_db_dir(directory, use_index=use_index))
+
+    def names(self) -> "list[str]":
+        return [n for n, _ in self.stores]
+
+    def exists(self) -> bool:
+        return any(st.exists() for _, st in self.stores)
+
+    def load(self) -> "dict[str, str]":
+        merged, _ = load_multi(self.entries)
+        return merged
+
+    def load_with_origin(self) -> "tuple[dict[str, str], dict[str, str]]":
+        return load_multi(self.entries)
+
+    def get(self, md5: str) -> "str | None":
+        key = normalize_md5(md5)
+        for _, st in self.stores:
+            pwd = st.load().get(key)
+            if pwd:
+                return pwd
+        return None
+
+    def origin_of(self, md5: str) -> "str | None":
+        key = normalize_md5(md5)
+        for name, st in self.stores:
+            if st.load().get(key):
+                return name
+        return None
+
+    def stats(self) -> "dict[str, object]":
+        merged = self.load()
+        per_db = []
+        for name, st in self.stores:
+            try:
+                data = st.load()
+                per_db.append(
+                    {
+                        "name": name,
+                        "path": st.path,
+                        "entries": len(data),
+                        "bytes": os.path.getsize(st.path) if st.exists() else 0,
+                    }
+                )
+            except DBError as exc:
+                per_db.append({"name": name, "path": st.path, "entries": 0, "error": str(exc)})
+        sizes = [len(v) for v in merged.values()]
+        bad = [k for k in merged if not is_md5(k)]
+        return {
+            "path": self.path,
+            "multi": True,
+            "entries": len(merged),
+            "invalid_keys": bad,
+            "avg_password_len": round(sum(sizes) / len(sizes), 2) if sizes else 0,
+            "max_password_len": max(sizes) if sizes else 0,
+            "dbs": per_db,
+        }
+
+    # ---- 写入：多库里必须指明写哪个，避免污染 ----
+    def _readonly(self) -> "DBError":
+        names = ", ".join(self.names())
+        return DBError(
+            f"多库目录（{self.path}）不支持直接写入；请用 -d/--db 指定具体库文件，"
+            f"或指定其中某一个：{names}"
+        )
+
+    def save(self, data):  # noqa: ANN001
+        raise self._readonly()
+
+    def put(self, md5: str, password: str) -> bool:
+        raise self._readonly()
+
+    def delete(self, md5: str) -> bool:
+        raise self._readonly()
+
+    def merge(self, incoming, *, overwrite: bool = False):  # noqa: ANN001
+        raise self._readonly()

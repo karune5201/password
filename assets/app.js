@@ -19,7 +19,7 @@
   const LS = {
     db: 'pwdash.db.v3',
     meta: 'pwdash.meta.v3',
-    sources: 'pwdash.sources.v2',
+    sources: 'pwdash.sources.v3',
     history: 'pwdash.history.v2',
     theme: 'pwdash.theme.v2',
     server: 'pwdash.server.v2',
@@ -39,17 +39,19 @@
   const LOCAL_SERVER = new URLSearchParams(location.search).get('server') || 'http://127.0.0.1:5000';
   const DEFAULT_SERVER_URL = IS_LOCAL ? LOCAL_SERVER : '';
 
-  // 多个库按顺序合并，靠前的优先。
-  // 想把自己的库和「陌生人投稿库」分开，就再加一条 community 的地址。
+  // 库在界面上就叫「仓库名」，一眼知道数据来自哪儿
+  const REPO_NAME = 'karune5201/password';
+
+  // 一个目录下可以放多个库：由目录里的 dbs.json 清单声明「有哪几个库、谁优先」。
+  // 清单格式：{"dbs":[{"name":"主库","file":"passwords_local.json"}, ...]}
+  // 不想用清单也行——直接把数据源填成某个 .json 库文件地址即可，两种都认。
+  const INDEX_FILE = 'dbs.json';
   const DEFAULT_SOURCES = IS_LOCAL
-    ? [
-        { name: '我的库', url: './passwords_local.json', enabled: true },
-        { name: '投稿库', url: './community_passwords.json', enabled: true },
-      ]
-    : [
-        { name: '我的库', url: `${GH_RAW}/passwords_local.json`, enabled: true },
-        { name: '投稿库', url: `${GH_RAW}/community_passwords.json`, enabled: true },
-      ];
+    ? [{ name: REPO_NAME, url: `./${INDEX_FILE}`, enabled: true }]
+    : [{ name: REPO_NAME, url: `${GH_RAW}/${INDEX_FILE}`, enabled: true }];
+
+  // 老部署没有 dbs.json 时，回退到这两个固定名字的文件
+  const LEGACY_FILES = ['passwords_local.json', 'community_passwords.json'];
 
   // ------------------------------------------------------------------
   // 状态
@@ -209,11 +211,30 @@
     return refreshInflight;
   }
 
+  // 一份 JSON 是不是「多库清单」
+  function asManifest(data) {
+    if (Array.isArray(data)) return data.filter((x) => x && (x.file || x.url || x.path));
+    if (data && typeof data === 'object' && Array.isArray(data.dbs)) {
+      return data.dbs.filter((x) => x && (x.file || x.url || x.path));
+    }
+    return null;
+  }
+
+  function stemOf(file) {
+    return String(file)
+      .split(/[?#]/)[0]
+      .split('/')
+      .pop()
+      .replace(/\.json\.gz$/i, '')
+      .replace(/\.json$/i, '')
+      .replace(/\.gz$/i, '');
+  }
+
   async function doRefreshDb(opts) {
     const list = activeSources();
     if (!list.length) throw new Error('没有启用任何数据源');
 
-    state.sourceStates = list.map((s) => ({ name: s.name, url: s.url, status: 'wait', detail: '' }));
+    state.sourceStates = [];
     renderSources();
 
     const merged = {};      // md5 -> password
@@ -222,31 +243,89 @@
     let lastErr = null;
     let okCount = 0;
 
-    for (let i = 0; i < list.length; i++) {
-      const src = list[i];
-      state.sourceStates[i].status = 'loading';
+    // 载入一个具体的库文件（label 是清单里的库名，单库数据源没有 label）
+    const loadDb = async (holder, label, url, prefetched) => {
+      const i = state.sourceStates.push({
+        name: holder,
+        label: label || '',
+        url,
+        status: 'loading',
+        detail: '',
+      }) - 1;
       renderSources();
       try {
-        const entries = normalizeDb(await fetchJson(src.url));
+        const raw = prefetched !== undefined ? prefetched : await fetchJson(url);
+        const entries = normalizeDb(raw);
         let added = 0;
+        const total = Object.keys(entries).length;
         for (const [md5, pwd] of Object.entries(entries)) {
           if (md5 in merged) continue; // 前面的库优先
           merged[md5] = pwd;
-          origin[md5] = src.name;
+          origin[md5] = label ? `${holder} · ${label}` : holder;
           added++;
         }
         okCount++;
         state.sourceStates[i].status = 'ok';
-        state.sourceStates[i].detail = `${added} 条` + (added < Object.keys(entries).length ? `（另 ${Object.keys(entries).length - added} 条已被高优先级库覆盖）` : '');
-        perSource.push({ name: src.name, url: src.url, count: Object.keys(entries).length, added });
-        renderSources();
+        state.sourceStates[i].detail =
+          `${added} 条` + (added < total ? `（另 ${total - added} 条已被高优先级库覆盖）` : '');
+        perSource.push({ name: holder, label: label || '', url, count: total, added });
       } catch (err) {
+        const msg = String((err && err.message) || err);
         state.sourceStates[i].status = 'err';
-        state.sourceStates[i].detail = String((err && err.message) || err);
-        perSource.push({ name: src.name, url: src.url, count: 0, added: 0, error: String((err && err.message) || err) });
-        renderSources();
+        state.sourceStates[i].detail = msg;
+        perSource.push({ name: holder, label: label || '', url, count: 0, added: 0, error: msg });
         lastErr = err;
       }
+      renderSources();
+    };
+
+    for (const src of list) {
+      let data;
+      try {
+        data = await fetchJson(src.url);
+      } catch (err) {
+        data = undefined;
+        lastErr = err;
+      }
+
+      const items = data === undefined ? null : asManifest(data);
+      if (items && items.length) {
+        // 清单模式：目录里有几个库就读几个，顺序即优先级
+        for (const item of items) {
+          if (item.enabled === false) continue;
+          const file = item.file || item.url || item.path;
+          let url;
+          try {
+            url = /^https?:/i.test(file) ? file : new URL(file, src.url).href;
+          } catch {
+            url = file;
+          }
+          await loadDb(src.name, item.name || stemOf(file), url);
+        }
+        continue;
+      }
+
+      if (data !== undefined) {
+        // 单个库文件
+        await loadDb(src.name, '', src.url, data);
+        continue;
+      }
+
+      // 清单取不到（老部署没有 dbs.json）→ 回退到固定文件名
+      if (stemOf(src.url).toLowerCase() === stemOf(INDEX_FILE).toLowerCase()) {
+        for (const file of LEGACY_FILES) {
+          let url;
+          try {
+            url = new URL(file, src.url).href;
+          } catch {
+            url = file;
+          }
+          await loadDb(src.name, stemOf(file), url);
+        }
+        continue;
+      }
+
+      await loadDb(src.name, '', src.url);
     }
 
     if (!okCount) {
@@ -266,7 +345,8 @@
     if (!cached) toast('密码库已加载，但本地缓存失败（存储空间不足）', 'err');
     renderMeta();
     const okLibs = perSource.filter((p) => !p.error);
-    const libText = okLibs.length > 1 ? `${okLibs.length} 个库合并` : (okLibs[0] && okLibs[0].name) || '数据源';
+    const repo = (okLibs[0] && okLibs[0].name) || REPO_NAME;
+    const libText = okLibs.length > 1 ? `${okLibs.length} 个库合并（${repo}）` : repo;
     pushLog('db', `密码库已更新：${Object.keys(merged).length} 条（${libText}）`, true);
     return state.db;
   }
@@ -298,6 +378,7 @@
     const cachedSources = Array.isArray(state.meta.sources) ? state.meta.sources : [];
     state.sourceStates = cachedSources.map((src) => ({
       name: src.name || src.url || '数据源',
+      label: src.label || '',
       url: src.url || '',
       status: src.error ? 'err' : 'ok',
       detail: src.error ? String(src.error) : `${src.count || 0} 条（本地缓存）`,
@@ -472,13 +553,16 @@
             ? el('span', { class: 'err', text: '✕' })
             : el('span', { class: 'wait', text: '…' });
         const tag = i === 0 ? '优先' : `第 ${i + 1} 库`;
+        const detail = [s.label, s.detail || (s.status === 'loading' ? '加载中' : '')]
+          .filter(Boolean)
+          .join(' · ');
         return el(
           'li',
-          { title: s.url },
+          { title: s.label ? `${s.label} — ${s.url}` : s.url },
           mark,
           el('span', { class: 'name', text: s.name }),
           el('span', { class: 'chip-mini', text: tag }),
-          el('span', { class: 'detail', text: s.detail || (s.status === 'loading' ? '加载中' : '') })
+          el('span', { class: 'detail', text: detail })
         );
       })
     );
@@ -493,7 +577,8 @@
     const count = Object.keys(state.db || {}).length;
     const libs = Array.isArray(meta.sources) ? meta.sources : [];
     const okLibs = libs.filter((l) => !l.error);
-    const libText = okLibs.length > 1 ? `${okLibs.length} 个库合并` : okLibs[0] ? okLibs[0].name : '本地缓存';
+    const repo = okLibs[0] ? okLibs[0].name : REPO_NAME;
+    const libText = okLibs.length > 1 ? `${okLibs.length} 个库合并（${repo}）` : okLibs[0] ? repo : '本地缓存';
     $('db-meta').textContent =
       `${count} 条记录 · ${libText} · 更新于 ${timeAgo(meta.savedAt)}${suffix || ''}`;
     renderCacheInfo();

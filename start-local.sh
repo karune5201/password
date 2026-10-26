@@ -60,6 +60,8 @@ port_busy() { # port_busy <port>
 import socket, sys
 port = int(sys.argv[1])
 s = socket.socket()
+# 允许复用：上一次服务退出后端口可能还在 TIME_WAIT，不该算「被占用」
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 try:
     s.bind(("127.0.0.1", port))
 except OSError:
@@ -104,12 +106,52 @@ if [ ! -s "$TOKEN_FILE" ]; then
 fi
 TOKEN=$(cat "$TOKEN_FILE")
 
-# ------------------------------------------------------------------ 库体检
+# ------------------------------------------------------------------ 库体检（一个目录可以有多个库）
 if [ ! -s "$DIR/passwords_local.json.gz" ]; then
   echo "🔧 库文件缺失，重新构建…"
   "$PY" tools/build_db.py
 fi
-[ -s "$DIR/community_passwords.json.gz" ] || printf '{}' | "$PY" -c 'import gzip,sys;open("community_passwords.json.gz","wb").write(gzip.compress(sys.stdin.buffer.read()))'
+# 没有多库清单就按目录内容生成一份（清单顺序 = 查询优先级）
+if [ ! -s "$DIR/dbs.json" ]; then
+  echo "🧾 生成多库清单 dbs.json…"
+  "$PY" tools/db_index.py "$DIR" >/dev/null
+fi
+# .json 比 .gz 新时补一份 .gz（网页读 .json，CLI 默认读 .gz）
+"$PY" - "$DIR" <<'PYSYNC'
+import os
+import sys
+
+d = sys.argv[1]
+sys.path.insert(0, os.path.join(d, "tools"))
+import pwlib  # noqa: E402
+
+try:
+    entries = pwlib.read_index(d)
+except Exception:  # noqa: BLE001
+    entries = []
+if not entries:
+    try:
+        entries = [{"name": n, "file": os.path.basename(p)} for n, p in pwlib.scan_db_dir(d)]
+    except Exception:  # noqa: BLE001
+        entries = []
+for item in entries:
+    name = item["file"]
+    if not name.endswith(".json") or name.endswith(".json.gz"):
+        continue
+    src = os.path.join(d, name)
+    dst = src + ".gz"
+    if not os.path.exists(src):
+        continue
+    if os.path.exists(dst) and os.path.getmtime(dst) >= os.path.getmtime(src):
+        continue
+    try:
+        with open(src, "rb") as fh:
+            data = pwlib.loads(fh.read())
+        pwlib.atomic_write(dst, pwlib.dumps(data, compress=True))
+        print(f"🔄 同步 {os.path.basename(dst)}（{len(data)} 条）")
+    except Exception as exc:  # noqa: BLE001
+        print(f"⚠️  同步 {name} 失败: {exc}", file=sys.stderr)
+PYSYNC
 
 # ------------------------------------------------------------------ 启动服务
 if running api; then
@@ -121,7 +163,7 @@ else
   fi
   PWDASH_TOKEN="$TOKEN" PWDASH_CONTRIB_MODE="$CONTRIB_MODE" nohup "$PY" server/server.py \
     --bind "$BIND" --port "$API_PORT" \
-    --db "$DIR/passwords_local.json.gz" \
+    --db-dir "$DIR" \
     --pending "$DIR/pending_uploads.json.gz" \
     --cors "$CORS_ORIGIN" \
     --contrib-mode "$CONTRIB_MODE" \

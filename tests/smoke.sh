@@ -290,6 +290,39 @@ check "--contrib-db 生效" "public" "$(curl -s -X POST http://127.0.0.1:$MPORT/
 kill "$SRV_PID" 2>/dev/null; SRV_PID=""
 
 echo
+echo "=== 6b. 多库目录（一个目录放多个库） ==="
+MD="$TMP/multidb"
+mkdir -p "$MD"
+python3 - "$MD" <<'PYMULTI'
+import json, os, sys
+d = sys.argv[1]
+json.dump({"a" * 32: "own-pass", "c" * 32: "own-first"}, open(os.path.join(d, "own.json"), "w"))
+json.dump({"b" * 32: "comm-pass", "c" * 32: "comm-second"}, open(os.path.join(d, "community.json"), "w"))
+PYMULTI
+check "db_index 生成清单" "0" "$(python3 "$ROOT/tools/db_index.py" "$MD" >/dev/null 2>&1; echo $?)"
+check "清单文件已生成" "yes" "$([ -s "$MD/dbs.json" ] && echo yes)"
+check "清单里有 2 个库" "2" "$(python3 -c 'import json;print(len(json.load(open("'"$MD"'/dbs.json"))["dbs"]))')"
+check "db_index --check 不写文件" "0" "$(python3 "$ROOT/tools/db_index.py" "$MD" --check >/dev/null 2>&1; echo $?)"
+check "跳过 pending/rejected" "no" "$(python3 -c 'import json;print("yes" if any("pending" in d["file"] for d in json.load(open("'"$MD"'/dbs.json"))["dbs"]) else "no")')"
+
+# CLI：--db-dir 只读多库，跨库合并、靠前优先
+check "CLI --db-dir 查第二个库" "comm-pass" "$(python3 "$ROOT/cli/pwdkit.py" --db-dir "$MD" query "$(printf 'b%.0s' $(seq 32))" -q)"
+check "CLI --db-dir 冲突取靠前库" "own-pass" "$(python3 "$ROOT/cli/pwdkit.py" --db-dir "$MD" query "$(printf 'a%.0s' $(seq 32))" -q)"
+check "CLI --db-dir 统计多库" "yes" "$(python3 "$ROOT/cli/pwdkit.py" --db-dir "$MD" stats --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print("yes" if d.get("multi") and len(d["dbs"])==2 else "no")')"
+check "CLI --db-dir 禁止写入" "3" "$(python3 "$ROOT/cli/pwdkit.py" --db-dir "$MD" add "$(printf 'd%.0s' $(seq 32))" xx >/dev/null 2>&1; echo $?)"
+
+# 服务端：--db-dir
+MPORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+PWDASH_TOKEN=testtoken python3 "$ROOT/server/server.py" --port "$MPORT" --db-dir "$MD" >"$TMP/multidb.log" 2>&1 &
+SRV_PID=$!
+for _ in $(seq 1 40); do curl -sf -m 1 "http://127.0.0.1:$MPORT/health" >/dev/null 2>&1 && break; sleep 0.2; done
+MB="http://127.0.0.1:$MPORT"
+check "服务端 --db-dir 两个库都在" "community,own" "$(curl -s $MB/health | python3 -c 'import json,sys;print(",".join(sorted(d["name"] for d in json.load(sys.stdin)["dbs"])))')"
+check "服务端跨库查询命中" "comm-pass" "$(curl -s $MB/query/$(printf 'b%.0s' $(seq 32)) | python3 -c 'import json,sys;print(json.load(sys.stdin)["password"])')"
+check "服务端冲突取靠前库" "own-pass" "$(curl -s $MB/query/$(printf 'a%.0s' $(seq 32)) | python3 -c 'import json,sys;print(json.load(sys.stdin)["password"])')"
+kill "$SRV_PID" 2>/dev/null; SRV_PID=""
+
+echo
 echo "=== 7. 前端资源 ==="
 for f in index.html sw.js manifest.webmanifest assets/app.css assets/app.js assets/md5.js assets/icon.svg assets/icon-192.png assets/icon-512.png; do
   check "存在 $f" "yes" "$([ -s "$ROOT/$f" ] && echo yes)"
@@ -298,6 +331,8 @@ check "index.html 引用了新样式" "yes" "$(grep -q 'assets/app.css' "$ROOT/i
 check "index.html 有 manifest" "yes" "$(grep -q 'manifest.webmanifest' "$ROOT/index.html" && echo yes)"
 check "无外链背景图" "no" "$(grep -rq 'api.rls.ovh' "$ROOT/index.html" "$ROOT/assets/" && echo yes || echo no)"
 check "manifest 是合法 JSON" "yes" "$(python3 -c 'import json;json.load(open("'"$ROOT"'/manifest.webmanifest"));print("yes")' 2>/dev/null)"
+check "仓库根有多库清单 dbs.json" "yes" "$([ -s "$ROOT/dbs.json" ] && echo yes)"
+check "dbs.json 是合法 JSON 且列出主库" "yes" "$(python3 -c 'import json;d=json.load(open("'"$ROOT"'/dbs.json"));print("yes" if any(x["file"]=="passwords_local.json" for x in d["dbs"]) else "no")')"
 
 echo
 echo "================ 结果 ================"

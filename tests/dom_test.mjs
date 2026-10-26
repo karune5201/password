@@ -60,6 +60,19 @@ const SECOND_DB = {};   // 第二个库（测试内合成，稍后填充）
 const server = createServer((req, res) => {
   let p = decodeURIComponent(req.url.split('?')[0]);
   if (p === '/' || p === '') p = '/index.html';
+  if (p === '/dbs-test.json') {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(
+      JSON.stringify({
+        version: 1,
+        dbs: [
+          { name: '主库', file: 'passwords_local.json' },
+          { name: '外来库', file: 'second-lib.json' },
+        ],
+      })
+    );
+    return;
+  }
   if (p === '/second-lib.json') {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify(SECOND_DB));
@@ -119,10 +132,9 @@ const dom = await JSDOM.fromURL(BASE, {
     window.Blob = globalThis.Blob;
     // 只在测试里：把默认数据源指到本地，避免依赖外网
     window.localStorage.setItem(
-      'pwdash.sources.v2',
+      'pwdash.sources.v3',
       JSON.stringify([
-        { name: '本地镜像', url: new URL('passwords_local.json', BASE).href, enabled: true },
-        { name: '第二库', url: new URL('second-lib.json', BASE).href, enabled: true },
+        { name: 'karune5201/password', url: new URL('dbs-test.json', BASE).href, enabled: true },
       ])
     );
   },
@@ -145,8 +157,10 @@ check('缓存条目数（两库合并）', entries.length + 1, Object.keys(JSON.
 check('数据源显示成功', true, !!document.querySelector('#source-list .ok'));
 check('库信息有记录数', true, /\d+ 条记录/.test($('db-meta').textContent));
 
-console.log('\n=== 1b. 多库合并 ===');
-check('两个数据源都成功', 2, document.querySelectorAll('#source-list .ok').length);
+console.log('\n=== 1b. 多库合并（dbs.json 清单驱动） ===');
+check('清单里的两个库都成功', 2, document.querySelectorAll('#source-list .ok').length);
+check('库名显示为仓库名', true, /karune5201\/password/.test($('source-list').textContent));
+check('清单里的库名也显示出来', true, /主库/.test($('source-list').textContent) && /外来库/.test($('source-list').textContent));
 check('库信息显示合并', true, /2 个库合并/.test($('db-meta').textContent));
 const mergedDb = JSON.parse(window.localStorage.getItem('pwdash.db.v3'));
 check('冲突项取靠前库的值', db[sampleMd5], mergedDb[sampleMd5]);

@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "dbs": [
+    {
+      "name": "主库",
+      "file": "passwords_local.json"
+    },
+    {
+      "name": "投稿库",
+      "file": "community_passwords.json"
+    }
+  ]
+}
