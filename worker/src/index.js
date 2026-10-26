@@ -36,12 +36,35 @@ const MD5_RE = /^[0-9a-f]{32}$/;
 // ---------------------------------------------------------------- 工具
 const enc = new TextEncoder();
 
+function parseDbs(env) {
+  // GH_DBS='main=passwords_local.json,community=community_passwords.json'
+  // 不配则退化为单库（GH_PATH）
+  const spec = env.GH_DBS || '';
+  const out = [];
+  if (spec.trim()) {
+    for (const item of spec.split(',')) {
+      const t = item.trim();
+      if (!t) continue;
+      const i = t.indexOf('=');
+      if (i > 0) out.push({ name: t.slice(0, i).trim(), path: t.slice(i + 1).trim() });
+      else out.push({ name: 'main', path: t });
+    }
+  }
+  if (!out.length) out.push({ name: 'main', path: env.GH_PATH || 'passwords_local.json' });
+  return out;
+}
+
 function cfg(env) {
+  const dbs = parseDbs(env);
+  const names = dbs.map((d) => d.name);
+  const contribDb = env.CONTRIB_DB || (names.includes('community') ? 'community' : names[names.length - 1]);
   return {
     owner: env.GH_OWNER || 'Karune-SHI-E',
     repo: env.GH_REPO || '1111',
     branch: env.GH_BRANCH || 'master',
-    path: env.GH_PATH || 'passwords_local.json',
+    dbs,
+    names,
+    contribDb,
     cors: env.CORS_ORIGIN || '*',
     mode: env.CONTRIB_MODE || 'queue',
     limit: Number(env.CONTRIB_LIMIT || 10),
@@ -186,9 +209,16 @@ class GitHub {
     return data;
   }
 
+  /** 某个库对应的仓库路径 */
+  pathOf(name) {
+    const found = this.cfg.dbs.find((d) => d.name === name);
+    return (found || this.cfg.dbs[0]).path;
+  }
+
   /** 读仓库里的密码库（无需 token，走 CDN） */
-  async readDb() {
-    const { owner, repo, branch, path } = this.cfg;
+  async readDb(name) {
+    const { owner, repo, branch } = this.cfg;
+    const path = this.pathOf(name);
     const url = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${path}`;
     const res = await fetch(url, { cf: { cacheTtl: 60, cacheEverything: true } });
     if (res.status === 404) return {};
@@ -205,10 +235,11 @@ class GitHub {
     return out;
   }
 
-  /** 把整库写回仓库（Contents API，自动带 sha 更新） */
-  async writeDb(entries, message) {
+  /** 把某个库写回仓库（Contents API，自动带 sha 更新） */
+  async writeDb(entries, message, name) {
     if (!this.ready) throw new Error('未配置 GH_TOKEN，无法回写仓库');
-    const { owner, repo, branch, path } = this.cfg;
+    const { owner, repo, branch } = this.cfg;
+    const path = this.pathOf(name);
     let sha;
     try {
       const cur = await this.api(`/repos/${owner}/${repo}/contents/${path}?ref=${branch}`);
@@ -231,13 +262,13 @@ class GitHub {
   }
 
   // ---- 纯 GitHub 模式：用 Issue 当待审队列 ----
-  async createIssue(md5, password, ip) {
+  async createIssue(md5, password, ip, db) {
     const { owner, repo } = this.cfg;
     const body = [
       '由 pwdash 投稿接口创建，等待审核。',
       '',
       '```json',
-      JSON.stringify({ md5, password }, null, 2),
+      JSON.stringify({ md5, password, db }, null, 2),
       '```',
       '',
       `- 来源 IP: ${ip}`,
@@ -265,7 +296,13 @@ class GitHub {
       try {
         const parsed = JSON.parse(match[1]);
         if (parsed.md5 && parsed.password) {
-          out.push({ id: issue.number, md5: String(parsed.md5).toLowerCase(), password: String(parsed.password), title: issue.title });
+          out.push({
+            id: issue.number,
+            md5: String(parsed.md5).toLowerCase(),
+            password: String(parsed.password),
+            db: parsed.db || this.cfg.contribDb,
+            title: issue.title,
+          });
         }
       } catch {
         /* 忽略格式不对的 issue */
@@ -341,14 +378,54 @@ export default {
       return null;
     };
 
-    // ---- 读库：KV 优先，否则读 GitHub ----
-    const loadDb = async () => {
+    // ---- 读库：单个库（KV 优先，否则读 GitHub）----
+    const loadDb = async (name) => {
       if (kv) {
-        const cached = await kv.getMap('db');
+        const cached = await kv.getMap(`db:${name}`);
         if (Object.keys(cached).length) return cached;
       }
-      return gh.readDb();
+      return gh.readDb(name);
     };
+
+    // ---- 读全部库并合并：靠前的库优先 ----
+    const loadAll = async () => {
+      const merged = {};
+      const origin = {};
+      const per = [];
+      for (const d of c.dbs) {
+        let entries = {};
+        let error = null;
+        try {
+          entries = await loadDb(d.name);
+        } catch (err) {
+          error = String((err && err.message) || err);
+        }
+        let added = 0;
+        for (const [md5, pwd] of Object.entries(entries)) {
+          if (md5 in merged) continue;
+          merged[md5] = pwd;
+          origin[md5] = d.name;
+          added++;
+        }
+        per.push({ name: d.name, path: d.path, count: Object.keys(entries).length, added, ...(error ? { error } : {}) });
+      }
+      return { merged, origin, per };
+    };
+
+    // ---- 跨库查找：返回 {db, password} ----
+    const findAny = async (md5) => {
+      for (const d of c.dbs) {
+        const db = await loadDb(d.name);
+        if (db[md5]) return { db: d.name, password: db[md5] };
+      }
+      return null;
+    };
+
+    // ---- 待审条目编码：KV 里存 {db, password}，兼容旧的纯字符串 ----
+    const pendingEntry = (value) =>
+      value && typeof value === 'object'
+        ? { db: value.db || c.contribDb, password: String(value.password || '') }
+        : { db: c.contribDb, password: String(value || '') };
 
     try {
       // ---------------- GET ----------------
@@ -359,16 +436,19 @@ export default {
             version: VERSION,
             backend: kv ? 'kv' : 'github',
             gh_token: gh.ready,
+            contrib_db: c.contribDb,
+            dbs: c.dbs.map((d) => ({ name: d.name, path: d.path })),
           });
         }
 
         if (path === '/stats') {
-          const db = await loadDb();
-          const bad = Object.keys(db).filter((k) => !MD5_RE.test(k));
+          const { merged, per } = await loadAll();
+          const bad = Object.keys(merged).filter((k) => !MD5_RE.test(k));
           return respond({
-            entries: Object.keys(db).length,
+            entries: Object.keys(merged).length,
             invalid_keys: bad.length,
             backend: kv ? 'kv' : 'github',
+            dbs: per,
             pending: kv ? Object.keys(await kv.getMap('pending')).length : (gh.ready ? (await gh.listIssues()).length : null),
           });
         }
@@ -381,17 +461,34 @@ export default {
           } catch (err) {
             return respond({ error: err.message }, 400);
           }
-          const db = await loadDb();
-          const password = db[md5];
-          if (!password) return respond({ error: '未找到该 MD5' }, 404);
-          return respond({ md5, password });
+          const wantDb = url.searchParams.get('db');
+          if (wantDb && !c.names.includes(wantDb)) {
+            return respond({ error: `没有名为 ${wantDb} 的库（可用: ${c.names.join(', ')}）` }, 400);
+          }
+          const hit = wantDb
+            ? (await loadDb(wantDb))[md5]
+              ? { db: wantDb, password: (await loadDb(wantDb))[md5] }
+              : null
+            : await findAny(md5);
+          if (!hit) return respond({ error: '未找到该 MD5' }, 404);
+          return respond({ md5, password: hit.password, db: hit.db });
         }
 
         if (path === '/db') {
           const denied = requireAdmin();
           if (denied) return denied;
-          const db = await loadDb();
-          return respond({ entries: db, count: Object.keys(db).length });
+          const wantDb = url.searchParams.get('db');
+          if (wantDb && !c.names.includes(wantDb)) {
+            return respond({ error: `没有名为 ${wantDb} 的库（可用: ${c.names.join(', ')}）` }, 400);
+          }
+          const name = wantDb || c.names[0];
+          const db = await loadDb(name);
+          return respond({
+            db: name,
+            entries: db,
+            count: Object.keys(db).length,
+            dbs: c.dbs.map((d) => ({ name: d.name, path: d.path })),
+          });
         }
 
         if (path === '/contrib/count') {
@@ -405,12 +502,25 @@ export default {
           if (denied) return denied;
           if (kv) {
             const pending = await kv.getMap('pending');
-            return respond({ count: Object.keys(pending).length, entries: pending });
+            const entries = {};
+            const detail = [];
+            for (const [md5, value] of Object.entries(pending)) {
+              const e = pendingEntry(value);
+              entries[md5] = e.password;
+              detail.push({ md5, password: e.password, db: e.db });
+            }
+            return respond({ count: detail.length, entries, detail, contrib_db: c.contribDb });
           }
           const issues = await gh.listIssues();
           const entries = {};
           for (const item of issues) entries[item.md5] = item.password;
-          return respond({ count: issues.length, entries, issues });
+          return respond({
+            count: issues.length,
+            entries,
+            issues,
+            detail: issues.map((i) => ({ md5: i.md5, password: i.password, db: i.db, issue: i.id })),
+            contrib_db: c.contribDb,
+          });
         }
 
         if (path === '/admin') {
@@ -455,16 +565,23 @@ export default {
             return respond({ error: err.message }, 400);
           }
 
-          const db = await loadDb();
-          if (db[md5]) return respond({ status: 'exists', md5 });
+          // 目标库：默认 community（陌生人的投稿单独一个库）
+          const wantDb = body.db || c.contribDb;
+          if (!c.names.includes(wantDb)) {
+            return respond({ error: `没有名为 ${wantDb} 的库（可用: ${c.names.join(', ')}）` }, 400);
+          }
+
+          // 任何一个库里已有，就不重复收
+          const existing = await findAny(md5);
+          if (existing) return respond({ status: 'exists', md5, db: existing.db });
 
           // auto 模式：直接入库
           if (c.mode === 'auto') {
             if (!gh.ready) return respond({ error: '未配置 GH_TOKEN，无法写入' }, 503);
-            const next = { ...db, [md5]: password };
-            if (kv) await kv.putMap('db', next);
-            await gh.writeDb(next, `feat(pwdash): 新增投稿 ${md5.slice(0, 8)}…`);
-            return respond({ status: 'accepted', md5 }, 201);
+            const next = { ...(await loadDb(wantDb)), [md5]: password };
+            if (kv) await kv.putMap(`db:${wantDb}`, next);
+            await gh.writeDb(next, `feat(pwdash): 新增投稿 ${md5.slice(0, 8)}…`, wantDb);
+            return respond({ status: 'accepted', md5, db: wantDb }, 201);
           }
 
           // queue 模式
@@ -474,9 +591,12 @@ export default {
             if (Object.keys(pending).length >= c.maxPending) {
               return respond({ error: '待审队列已满，请稍后再试', pending: Object.keys(pending).length }, 429);
             }
-            pending[md5] = password;
+            pending[md5] = { db: wantDb, password };
             await kv.putMap('pending', pending);
-            return respond({ status: 'pending', md5, message: '已提交，等管理员审核后生效', pending: Object.keys(pending).length }, 202);
+            return respond(
+              { status: 'pending', md5, db: wantDb, message: '已提交，等管理员审核后生效', pending: Object.keys(pending).length },
+              202
+            );
           }
 
           // 纯 GitHub 模式：开 Issue
@@ -484,8 +604,11 @@ export default {
           const issues = await gh.listIssues();
           if (issues.some((i) => i.md5 === md5)) return respond({ status: 'already_pending', md5 });
           if (issues.length >= c.maxPending) return respond({ error: '待审队列已满，请稍后再试' }, 429);
-          const issue = await gh.createIssue(md5, password, ip);
-          return respond({ status: 'pending', md5, issue: issue.number, message: '已创建审核 Issue，等待处理' }, 202);
+          const issue = await gh.createIssue(md5, password, ip, wantDb);
+          return respond(
+            { status: 'pending', md5, db: wantDb, issue: issue.number, message: '已创建审核 Issue，等待处理' },
+            202
+          );
         }
 
         // 以下都需要 admin
@@ -495,7 +618,6 @@ export default {
 
           if (path === '/contrib/approve' || path === '/contrib/reject') {
             const approve = path === '/contrib/approve';
-            const db = await loadDb();
 
             if (kv) {
               const pending = await kv.getMap('pending');
@@ -503,28 +625,43 @@ export default {
               if (!targets.length) return respond({ error: '需要 ids 列表或 all=true' }, 400);
               const done = [];
               const skipped = [];
-              const next = { ...db };
+              const touched = new Set();   // 本次改到的库
+              const byDb = {};             // 库名 -> 条目
               for (const md5 of targets) {
                 if (!pending[md5]) {
                   skipped.push(md5);
                   continue;
                 }
-                if (approve) next[md5] = pending[md5];
+                const entry = pendingEntry(pending[md5]);
+                if (approve) {
+                  (byDb[entry.db] ||= {})[md5] = entry.password;
+                  touched.add(entry.db);
+                }
                 delete pending[md5];
                 done.push(md5);
               }
-              if (approve && done.length) {
-                await kv.putMap('db', next);
+              const warnings = [];
+              for (const [dbName, items] of Object.entries(byDb)) {
+                const next = { ...(await loadDb(dbName)), ...items };
+                await kv.putMap(`db:${dbName}`, next);
                 if (gh.ready) {
                   try {
-                    await gh.writeDb(next, `feat(pwdash): 审核通过 ${done.length} 条投稿`);
+                    await gh.writeDb(next, `feat(pwdash): 审核通过 ${Object.keys(items).length} 条投稿 → ${dbName}`, dbName);
                   } catch (err) {
-                    return respond({ ok: false, done, skipped, pending: Object.keys(pending).length, warning: `KV 已更新，但回写 GitHub 失败: ${err.message}` }, 200);
+                    warnings.push(`${dbName} 回写 GitHub 失败: ${err.message}`);
                   }
                 }
               }
               await kv.putMap('pending', pending);
-              return respond({ approved: approve ? done.length : 0, rejected: approve ? 0 : done.length, done, skipped, pending: Object.keys(pending).length });
+              return respond({
+                approved: approve ? done.length : 0,
+                rejected: approve ? 0 : done.length,
+                done,
+                skipped,
+                pending: Object.keys(pending).length,
+                dbs: [...touched],
+                ...(warnings.length ? { warning: warnings.join('; ') } : {}),
+              });
             }
 
             // 纯 GitHub 模式：按 Issue 处理
@@ -532,25 +669,42 @@ export default {
             const targets = body.all ? issues.map((i) => i.md5) : [].concat(body.ids || []).map((s) => String(s).trim().toLowerCase());
             const done = [];
             const skipped = [];
-            const next = { ...db };
+            const byDb = {};
+            const touched = new Set();
             for (const md5 of targets) {
               const issue = issues.find((i) => i.md5 === md5);
               if (!issue) {
                 skipped.push(md5);
                 continue;
               }
-              if (approve) next[md5] = issue.password;
-              await gh.closeIssue(issue.id, approve ? `✅ 已合并入库（${md5}）` : '❌ 未采纳');
+              if (approve) {
+                (byDb[issue.db] ||= {})[md5] = issue.password;
+                touched.add(issue.db);
+              }
+              await gh.closeIssue(issue.id, approve ? `✅ 已合并入库 ${issue.db}（${md5}）` : '❌ 未采纳');
               done.push(md5);
             }
-            if (approve && done.length) await gh.writeDb(next, `feat(pwdash): 审核通过 ${done.length} 条投稿`);
-            return respond({ approved: approve ? done.length : 0, rejected: approve ? 0 : done.length, done, skipped });
+            for (const [dbName, items] of Object.entries(byDb)) {
+              const next = { ...(await loadDb(dbName)), ...items };
+              await gh.writeDb(next, `feat(pwdash): 审核通过 ${Object.keys(items).length} 条投稿 → ${dbName}`, dbName);
+            }
+            return respond({
+              approved: approve ? done.length : 0,
+              rejected: approve ? 0 : done.length,
+              done,
+              skipped,
+              dbs: [...touched],
+            });
           }
 
           if (path === '/bulk') {
             const entries = body.entries;
             if (!entries || typeof entries !== 'object') return respond({ error: 'entries 必须是对象' }, 400);
-            const next = { ...db0Safe(await loadDb()) };
+            const bulkDb = body.db || c.names[0];
+            if (!c.names.includes(bulkDb)) {
+              return respond({ error: `没有名为 ${bulkDb} 的库（可用: ${c.names.join(', ')}）` }, 400);
+            }
+            const next = { ...db0Safe(await loadDb(bulkDb)) };
             let added = 0;
             let updated = 0;
             let invalid = 0;
@@ -571,10 +725,10 @@ export default {
               next[key] = v;
               added++;
             }
-            if (!added && !updated) return respond({ ok: true, added, updated, invalid, note: '没有变化' });
-            if (kv) await kv.putMap('db', next);
-            if (gh.ready) await gh.writeDb(next, `feat(pwdash): 批量导入 ${added} 条 / 更新 ${updated} 条`);
-            return respond({ ok: true, added, updated, invalid });
+            if (!added && !updated) return respond({ ok: true, added, updated, invalid, db: bulkDb, note: '没有变化' });
+            if (kv) await kv.putMap(`db:${bulkDb}`, next);
+            if (gh.ready) await gh.writeDb(next, `feat(pwdash): 批量导入 ${added} 条 / 更新 ${updated} 条 → ${bulkDb}`, bulkDb);
+            return respond({ ok: true, added, updated, invalid, db: bulkDb });
           }
 
           // /upload：单条
@@ -587,12 +741,16 @@ export default {
           } catch (err) {
             return respond({ error: err.message }, 400);
           }
-          const db = await loadDb();
-          if (db[md5] === password) return respond({ status: 'exists', md5 });
+          const upDb = body.db || c.names[0];
+          if (!c.names.includes(upDb)) {
+            return respond({ error: `没有名为 ${upDb} 的库（可用: ${c.names.join(', ')}）` }, 400);
+          }
+          const db = await loadDb(upDb);
+          if (db[md5] === password) return respond({ status: 'exists', md5, db: upDb });
           const next = { ...db, [md5]: password };
-          if (kv) await kv.putMap('db', next);
-          if (gh.ready) await gh.writeDb(next, `feat(pwdash): 新增 ${md5.slice(0, 8)}…`);
-          return respond({ status: 'created', md5 }, 201);
+          if (kv) await kv.putMap(`db:${upDb}`, next);
+          if (gh.ready) await gh.writeDb(next, `feat(pwdash): 新增 ${md5.slice(0, 8)}… → ${upDb}`, upDb);
+          return respond({ status: 'created', md5, db: upDb }, 201);
         }
 
         return respond({ error: '未知接口' }, 404);

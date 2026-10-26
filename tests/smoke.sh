@@ -254,6 +254,41 @@ python3 "$ROOT/cli/pwdkit.py" --server "$C3" --token wrong review --list >/dev/n
 check "错误 token 被拒（退出码 7）" "7" "$?"
 kill "$SRV_PID" 2>/dev/null; SRV_PID=""
 
+
+echo
+echo "=== 6c. 多库（自己的库 + 陌生人库）==="
+ML="$TMP/ml"; mkdir -p "$ML"
+cp "$ROOT/passwords_local.json.gz" "$ML/main.json.gz"
+MPORT=$(( PORT + 2 ))
+PWDASH_TOKEN=testtoken python3 "$ROOT/server/server.py" --port "$MPORT" \
+  --db "$ML/main.json.gz" --contrib-mode queue >"$ML/srv.log" 2>&1 &
+SRV_PID=$!
+for _ in $(seq 1 40); do curl -sf -m 1 "http://127.0.0.1:$MPORT/health" >/dev/null 2>&1 && break; sleep 0.2; done
+MB="http://127.0.0.1:$MPORT"
+
+check "启动即两个库" "main,community" "$(curl -s $MB/health | python3 -c 'import json,sys;print(",".join(d["name"] for d in json.load(sys.stdin)["dbs"]))')"
+SMD5=$(python3 -c "import hashlib;print(hashlib.md5(b'stranger-only').hexdigest())")
+curl -s -X POST $MB/contribute -H 'Content-Type: application/json' -d '{"password":"stranger-only"}' >/dev/null
+check "待审记录标注目标库" "community" "$(curl -s -H 'Authorization: Bearer testtoken' $MB/contrib/pending | python3 -c 'import json,sys;print(json.load(sys.stdin)["detail"][0]["db"])')"
+curl -s -X POST $MB/contrib/approve -H 'Authorization: Bearer testtoken' -H 'Content-Type: application/json' -d '{"all":true}' >/dev/null
+check "投稿落在 community 库" "community" "$(curl -s $MB/query/$SMD5 | python3 -c 'import json,sys;print(json.load(sys.stdin).get("db",""))')"
+check "主库没被污染" "404" "$(curl -s -o /dev/null -w '%{http_code}' "$MB/query/$SMD5?db=main")"
+check "只查 community 能查到" "stranger-only" "$(curl -s "$MB/query/$SMD5?db=community" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("password",""))')"
+check "主库记录仍在" "200" "$(curl -s -o /dev/null -w '%{http_code}' "$MB/query/$(python3 -c "import json;print(list(json.load(open('$ROOT/passwords_local.json')))[0])")?db=main")"
+check "不存在的库名 400" "400" "$(curl -s -o /dev/null -w '%{http_code}' "$MB/query/$SMD5?db=ghost")"
+check "两个库各自落盘" "2" "$(ls $ML/main.json.gz $ML/community_passwords.json.gz 2>/dev/null | wc -l)"
+kill "$SRV_PID" 2>/dev/null; SRV_PID=""
+
+# --dbs 显式配置 + 自定义投稿库
+PWDASH_TOKEN=testtoken python3 "$ROOT/server/server.py" --port "$MPORT" \
+  --dbs "own=$ML/main.json.gz,public=$ML/community_passwords.json.gz" --contrib-db public \
+  --contrib-mode queue >"$ML/srv2.log" 2>&1 &
+SRV_PID=$!
+for _ in $(seq 1 40); do curl -sf -m 1 "http://127.0.0.1:$MPORT/health" >/dev/null 2>&1 && break; sleep 0.2; done
+check "--dbs 自定义库名" "own,public" "$(curl -s http://127.0.0.1:$MPORT/health | python3 -c 'import json,sys;print(",".join(d["name"] for d in json.load(sys.stdin)["dbs"]))')"
+check "--contrib-db 生效" "public" "$(curl -s -X POST http://127.0.0.1:$MPORT/contribute -H 'Content-Type: application/json' -d '{"password":"x2"}' | python3 -c 'import json,sys;print(json.load(sys.stdin).get("db",""))')"
+kill "$SRV_PID" 2>/dev/null; SRV_PID=""
+
 echo
 echo "=== 7. 前端资源 ==="
 for f in index.html sw.js manifest.webmanifest assets/app.css assets/app.js assets/md5.js assets/icon.svg assets/icon-192.png assets/icon-512.png; do

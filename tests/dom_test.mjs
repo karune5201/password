@@ -5,7 +5,7 @@
  *   node tests/dom_test.mjs   # 自动拉起静态服务、加载 index.html、执行真实交互
  *
  * 覆盖：多源加载与缓存、单条查询、显示/隐藏、批量查询、历史、非法输入、
- *       设置面板、主题、导入导出、缓存清理、SW 注册容错。
+ *       设置面板、主题、多库合并、缓存清理、SW 注册容错。
  */
 import { createServer } from 'node:http';
 import fs from 'node:fs';
@@ -56,9 +56,15 @@ const MIME = {
   '.png': 'image/png',
 };
 
+const SECOND_DB = {};   // 第二个库（测试内合成，稍后填充）
 const server = createServer((req, res) => {
   let p = decodeURIComponent(req.url.split('?')[0]);
   if (p === '/' || p === '') p = '/index.html';
+  if (p === '/second-lib.json') {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify(SECOND_DB));
+    return;
+  }
   const file = path.join(ROOT, p);
   if (!file.startsWith(ROOT) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
     res.writeHead(404).end('not found');
@@ -76,6 +82,12 @@ const db = JSON.parse(dbRaw);
 const entries = Object.entries(db).filter(([k]) => /^[0-9a-f]{32}$/.test(k));
 const [sampleMd5, samplePwd] = entries[0];
 const missingMd5 = 'f'.repeat(32);
+
+// 第二库：一条与主库 md5 冲突（值不同，用于验证「靠前优先」），一条主库没有的
+const conflictMd5 = sampleMd5;
+SECOND_DB[conflictMd5] = '__from_second_lib__';
+const uniqueMd5 = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
+SECOND_DB[uniqueMd5] = 'only-in-second-lib';
 
 // ---------------------------------------------------------------- 加载页面
 const errors = [];
@@ -103,7 +115,10 @@ const dom = await JSDOM.fromURL(BASE, {
     // 只在测试里：把默认数据源指到本地，避免依赖外网
     window.localStorage.setItem(
       'pwdash.sources.v2',
-      JSON.stringify([{ name: '本地镜像', url: new URL('passwords_local.json', BASE).href, enabled: true }])
+      JSON.stringify([
+        { name: '本地镜像', url: new URL('passwords_local.json', BASE).href, enabled: true },
+        { name: '第二库', url: new URL('second-lib.json', BASE).href, enabled: true },
+      ])
     );
   },
 });
@@ -115,15 +130,22 @@ const $ = (id) => document.getElementById(id);
 console.log('=== 1. 初始化 ===');
 await waitFor(() => window.document.readyState === 'complete', 8000, 'load');
 await waitFor(
-  () => Object.keys(JSON.parse(window.localStorage.getItem('pwdash.db.v2') || '{}')).length > 0,
+  () => Object.keys(JSON.parse(window.localStorage.getItem('pwdash.db.v3') || '{}')).length > 0,
   8000,
   '密码库加载'
 );
 check('标题', '密码查询 · pwdash', document.title);
 check('标签页数量', 4, document.querySelectorAll('.tab').length);
-check('缓存条目数', entries.length, Object.keys(JSON.parse(window.localStorage.getItem('pwdash.db.v2'))).length);
+check('缓存条目数（两库合并）', entries.length + 1, Object.keys(JSON.parse(window.localStorage.getItem('pwdash.db.v3'))).length);
 check('数据源显示成功', true, !!document.querySelector('#source-list .ok'));
 check('库信息有记录数', true, /\d+ 条记录/.test($('db-meta').textContent));
+
+console.log('\n=== 1b. 多库合并 ===');
+check('两个数据源都成功', 2, document.querySelectorAll('#source-list .ok').length);
+check('库信息显示合并', true, /2 个库合并/.test($('db-meta').textContent));
+const mergedDb = JSON.parse(window.localStorage.getItem('pwdash.db.v3'));
+check('冲突项取靠前库的值', db[sampleMd5], mergedDb[sampleMd5]);
+check('靠后库的独有条目也在', 'only-in-second-lib', mergedDb[uniqueMd5]);
 
 console.log('\n=== 2. 单条查询 ===');
 $('md5-input').value = sampleMd5;
@@ -207,7 +229,7 @@ check('未配置服务端时给出提示', true, /还没有配置服务端/.test
 console.log('\n=== 12. 清除缓存 ===');
 $('btn-clear-cache').click();
 await sleep(120);
-check('缓存被清除', null, window.localStorage.getItem('pwdash.db.v2'));
+check('缓存被清除', null, window.localStorage.getItem('pwdash.db.v3'));
 check('提示已更新', true, /缓存已清除/.test($('db-meta').textContent));
 
 console.log('\n=== 13. 无 JS 异常 ===');

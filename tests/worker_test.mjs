@@ -43,9 +43,10 @@ class FakeKV {
 }
 
 // ---------------------------------------------------------------- 假 GitHub
-function installGithubMock(initialDb) {
+function installGithubMock(initialDb, files = {}) {
   const state = {
     db: { ...initialDb },
+    files: { ...files },   // path -> entries（多库）
     issues: [],
     nextIssue: 1,
     commits: [],
@@ -57,9 +58,11 @@ function installGithubMock(initialDb) {
     const method = (init.method || 'GET').toUpperCase();
     state.calls.push(`${method} ${url.split('?')[0]}`);
 
-    // 仓库原始文件
+    // 仓库原始文件（按路径区分库；未在 files 里的回落到 state.db）
     if (url.startsWith('https://raw.githubusercontent.com/')) {
-      return new Response(JSON.stringify(state.db), {
+      const path = url.split('/').slice(6).join('/');
+      const body = path in state.files ? state.files[path] : state.db;
+      return new Response(JSON.stringify(body), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       });
@@ -72,12 +75,15 @@ function installGithubMock(initialDb) {
         { status: 200, headers: { 'Content-Type': 'application/json' } }
       );
     }
-    // Contents API：写文件
+    // Contents API：写文件（按路径归属哪个库）
     if (url.includes('/contents/') && method === 'PUT') {
       const body = JSON.parse(init.body);
+      const path = url.split('/contents/')[1].split('?')[0];
       const decoded = Buffer.from(body.content, 'base64').toString('utf8');
-      state.db = JSON.parse(decoded);
-      state.commits.push({ message: body.message, count: Object.keys(state.db).length });
+      const data = JSON.parse(decoded);
+      if (path in state.files) state.files[path] = data;
+      else state.db = data;
+      state.commits.push({ path, message: body.message, count: Object.keys(data).length });
       return new Response(JSON.stringify({ content: { sha: 'newsha' } }), { status: 200 });
     }
     // Issues：创建
@@ -137,6 +143,8 @@ const baseEnv = (extra = {}) => ({
   GH_REPO: 'repo',
   GH_BRANCH: 'master',
   GH_PATH: 'passwords_local.json',
+  GH_DBS: 'main=passwords_local.json,community=community_passwords.json',
+  CONTRIB_DB: 'community',
   GH_TOKEN: 'gh-token',
   ADMIN_TOKEN: 'admin-token',
   CONTRIB_MODE: 'queue',
@@ -319,6 +327,76 @@ console.log('\n=== D. 管理页 ===');
   const html = await res.text();
   check('管理页返回 HTML', 'text/html; charset=utf-8', res.headers.get('Content-Type'));
   check('管理页含审核按钮', true, /全部通过/.test(html));
+}
+
+console.log('\n=== E. 多库（自己的库 + 陌生人库）===');
+{
+  installGithubMock({});
+  const kv = new FakeKV();
+  const env = baseEnv({ DB: kv });
+  const MAIN = 'main=passwords_local.json';
+  const COMM = 'community=community_passwords.json';
+
+  // 两个库各放数据；同一个 md5 在两个库都有值时，主库优先
+  const DUP = 'd'.repeat(32);
+  const gh = installGithubMock({}, {
+    'passwords_local.json': { [DUP]: 'main-version', ['e'.repeat(32)]: 'main-only' },
+    'community_passwords.json': { [DUP]: 'community-version', ['f'.repeat(32)]: 'community-only' },
+  });
+
+  let r = await call(env, 'GET', '/health');
+  check('health 报两个库', ['main', 'community'], r.data.dbs.map((d) => d.name));
+  check('health 报投稿默认库', 'community', r.data.contrib_db);
+
+  r = await call(env, 'GET', '/stats');
+  check('stats 列出两个库', 2, r.data.dbs.length);
+  check('stats 合并计数', 3, r.data.entries);
+
+  r = await call(env, 'GET', `/query/${DUP}`);
+  check('重复时主库优先', 'main-version', r.data.password);
+  check('返回值带库名', 'main', r.data.db);
+
+  r = await call(env, 'GET', `/query/${'f'.repeat(32)}`);
+  check('陌生人库的记录也能查到', 'community-only', r.data.password);
+  check('来源标为 community', 'community', r.data.db);
+
+  r = await call(env, 'GET', `/query/${'f'.repeat(32)}?db=main`);
+  check('限定 main 库查不到', 404, r.status);
+  r = await call(env, 'GET', `/query/${DUP}?db=community`);
+  check('限定 community 库取到社区版本', 'community-version', r.data.password);
+  r = await call(env, 'GET', `/query/${DUP}?db=nope`);
+  check('不存在的库名 → 400', 400, r.status);
+
+  r = await call(env, 'GET', '/db?db=community', { token: 'admin-token' });
+  check('/db?db=community', 'community', r.data.db);
+  check('/db 返回该库条数', 2, r.data.count);
+
+  // 投稿默认进 community
+  r = await call(env, 'POST', '/contribute', { body: { password: 'stranger-from-web' } });
+  check('投稿 202', 202, r.status);
+  check('投稿目标是 community', 'community', r.data.db);
+  const strangerMd5 = r.data.md5;
+
+  // 可以指定写到别的库
+  r = await call(env, 'POST', '/contribute', { body: { password: 'to-main', db: 'main' } });
+  check('可指定投稿到 main', 'main', r.data.db);
+  r = await call(env, 'POST', '/contribute', { body: { password: 'x', db: 'ghost' } });
+  check('指定不存在的库 → 400', 400, r.status);
+
+  // 待审明细带目标库
+  r = await call(env, 'GET', '/contrib/pending', { token: 'admin-token' });
+  check('待审明细含目标库', true, r.data.detail.every((d) => d.db === 'main' || d.db === 'community'));
+
+  // 审核通过：写回各自文件
+  r = await call(env, 'POST', '/contrib/approve', { body: { all: true }, token: 'admin-token' });
+  check('审核通过 2 条', 2, r.data.approved);
+  check('审核涉及两个库', true, new Set(r.data.dbs).size === 2);
+
+  r = await call(env, 'GET', `/query/${strangerMd5}?db=community`);
+  check('陌生人投稿落在 community', 'stranger-from-web', r.data.password);
+  check('community 文件已包含新条目', 'stranger-from-web', gh.files['community_passwords.json'][strangerMd5]);
+  check('main 库没被陌生人投稿污染', true, !('main-only' in { }) && Object.keys(gh.files['passwords_local.json']).length === 3);
+  check('回写 commit 提到两个库', true, gh.commits.some((c) => c.path === 'community_passwords.json') && gh.commits.some((c) => c.path === 'passwords_local.json'));
 }
 
 console.log('\n================ 结果 ================');

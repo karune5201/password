@@ -17,6 +17,7 @@
   - [3. 自建服务端](#3-自建服务端)
 - [命令速查](#命令速查)
 - [数据格式与维护](#数据格式与维护)
+- [多库：自己的库 / 陌生人的库](#多库自己的库--陌生人的库)
 - [让别人上传 MD5 和密码](#让别人上传-md5-和密码)
 - [全托管部署：GitHub + Cloudflare Workers & Pages](#全托管部署github--cloudflare-workers--pages)
 - [其它部署方式](#其它部署方式)
@@ -37,9 +38,9 @@
 | 拖入文件算 MD5 | 浏览器内流式计算，文件**不上传**；支持 7z / zip / rar 等任意文件 |
 | 批量查询 | 一次粘贴多个 MD5（换行/空格/逗号分隔），结果列表可一键复制 |
 | 密码打码 | 命中后默认打码，点「显示」看明文，一键复制 |
-| 多数据源 | 按优先级依次尝试，任一可用即生效；可在设置里增删、排序、启停 |
-| 离线可用 | 整库缓存到 localStorage + Service Worker，断网照样查 |
-| 导入/导出 | 支持导入 `.json` 与 `.json.gz`（就地解压），随时导出当前库 |
+| 多库合并 | 可配任意多个库（如「自己的库」+「陌生人投稿库」），按顺序合并，**靠前优先**；设置里可增删、排序、启停 |
+| 离线可用 | 合并结果整库缓存到 localStorage + Service Worker，断网照样查 |
+| 只读设计 | 不提供导入/导出按钮，防止误把别人的库覆盖到自己身上；改库走 CLI |
 | 公开投稿 | 「投稿」页签可把自己的密码提交给别人（进审核队列），支持从文件取 MD5 |
 | 无痕 | 无埋点、无外链图片/字体，纯本地渲染 |
 | 其他 | 深/浅色主题、查询历史、`/` 与 `Ctrl+K` 快捷键、`?md5=` 直达、可安装为 PWA |
@@ -97,11 +98,12 @@ password/
 │   ├── serve.py            # 本地预览静态服务
 │   └── git-menu.sh         # 通用 git 操作菜单（原 1.sh）
 ├── tests/
-│   ├── smoke.sh            # 全链路自测（70 项）
+│   ├── smoke.sh            # 全链路自测（80 项）
 │   ├── dom_test.mjs        # jsdom 跑真实 app.js（29 项）
 │   └── web_test.mjs        # 无头 Chrome 端到端（CDP，无需 puppeteer）
 ├── passwords_local.json    # 网页版明文库（发到 GitHub 供前端 fetch）
 ├── passwords_local.json.gz # 命令行用压缩库
+├── community_passwords.json # 陌生人投稿库（审核通过后写入；初始为 {}）
 ├── data/rejected.json      # 被清洗掉的脏记录（备查，不参与查询）
 ├── pending_uploads.json.gz # 公开投稿的待审队列（首次有投稿时自动生成）
 ├── 1.py / 2.py             # 旧入口的兼容壳（等价于 pwdkit menu / build_db）
@@ -240,6 +242,64 @@ python3 tools/build_db.py --report data/rejected.json           # 导出被剔�
 清洗规则：key 必须是 32 位 MD5、密码非空、长度 ≤ 256。被剔除的记录写入 `data/rejected.json`
 而不是直接丢掉，可人工复核。**写入都是原子操作**（临时文件 + `os.replace` + 文件锁），
 中途断电或并发写入不会把库写坏。
+
+---
+
+## 多库：自己的库 / 陌生人的库
+
+投稿一旦开放，就不该和主库混在一起——别人塞进来的字符串会直接改变你的查询结果。
+所以库是**可以拆成多个**的：各自独立文件、独立审核、查询时按顺序合并。
+
+### 默认布局
+
+| 库名 | 文件 | 谁的 | 说明 |
+| --- | --- | --- | --- |
+| `main` | `passwords_local.json` | 你的 | 你自己维护，优先级最高 |
+| `community` | `community_passwords.json` | 陌生人的 | 投稿先落这里，审核通过才生效 |
+
+查询规则：**先查 `main`，再查 `community`**；同一个 MD5 两个库都有时用 `main` 的值。
+任何一个库里已有这条记录，投稿接口就直接回 `exists`，不会重复堆。
+
+### 服务端怎么开多库
+
+```bash
+# 最简单：给一个主库，第二个库自动按约定生成
+python3 server/server.py --bind 0.0.0.0 --port 5000 --db data/passwords_local.json.gz
+
+# 自定义：名字=路径，逗号分隔，**靠前的优先**
+python3 server/server.py --bind 0.0.0.0 --port 5000 \
+  --dbs "own=data/my.json.gz,public=data/community.json.gz" \
+  --contrib-db public
+```
+
+- `--dbs`：多库配置，等价环境变量 `PWDASH_DBS`
+- `--contrib-db`：陌生人投稿默认写进哪个库，等价 `PWDASH_CONTRIB_DB`
+- 查询可指定库：`GET /query/<md5>?db=community`，不指定就跨库查找
+- 待审记录会记住「该进哪个库」，审核通过时自动写回对应的库
+
+### Worker 怎么开多库
+
+```toml
+# worker/wrangler.toml
+GH_PATH = "passwords_local.json"
+GH_DBS = "main=passwords_local.json,community=community_passwords.json"
+CONTRIB_DB = "community"
+```
+
+审核通过后，Worker 会分别 commit 到各自的文件；`community_passwords.json` 不存在时自动新建。
+
+### 网页怎么用多库
+
+设置 → 数据源，按优先级列出来即可：
+
+1. `我的库` → `.../passwords_local.json`
+2. `投稿库` → `.../community_passwords.json`
+
+页面会合并两个库，并在「库信息」显示「2 个库合并」；设置里每个源后面标着「优先 / 第 2 库」。
+某一条命中时，结果里会注明它来自哪个库。
+
+> 投稿库暂时是空的（`{}`）也没关系：那个源会显示 ✕，主库照常可用；
+> 等有人投稿并通过审核，它就有内容了。
 
 ---
 
@@ -490,16 +550,16 @@ const DEFAULT_SERVER_URL = 'https://pwdash.<你的账号>.workers.dev';
 ## 测试
 
 ```bash
-bash tests/smoke.sh        # 70 项：库读写、清洗、CLI、解压、服务端、投稿审核、前端资源
+bash tests/smoke.sh        # 80 项：库读写、清洗、CLI、解压、服务端、投稿审核、多库、前端资源
 ```
 
 需要 Node 时可选跑前端：
 
 ```bash
 npm install jsdom
-node tests/dom_test.mjs                                    # 31 项，用真实 app.js 跑交互
+node tests/dom_test.mjs                                    # 35 项，用真实 app.js 跑交互
 node tests/web_test.mjs --chrome "$(which google-chrome)"   # 真浏览器 CDP 端到端
-node tests/worker_test.mjs                                 # 54 项，Worker 双后端（mock KV + mock GitHub）
+node tests/worker_test.mjs                                 # 78 项，Worker 双后端 + 多库（mock KV + mock GitHub）
 ```
 
 `smoke.sh` 全程使用临时目录与随机端口，不会动仓库里的真实密码库。
@@ -539,6 +599,15 @@ node tests/worker_test.mjs                                 # 54 项，Worker 双
 
 **Q：别人怎么给我投稿？**
 见 [让别人上传 MD5 和密码](#让别人上传-md5-和密码)。默认是「投稿进队列 → 我审核」，不会污染主库。
+
+**Q：为什么网页没有导入/导出了？**
+按需求去掉了。现在网页只负责查和投稿，改库统一走 CLI——避免手滑把别人的库盖到自己库上，
+也避免「导出的库再导入回来」这种容易出错的操作。需要搬运数据就用：
+`pwdash export -o x.json` / `pwdash import x.json`。
+
+**Q：陌生人的投稿会不会把我的库搞乱？**
+不会。投稿默认落到独立的 `community` 库，和你的 `main` 库是两个文件；
+而且要你审核通过才进库，查询时 `main` 优先。详见 [多库](#多库自己的库--陌生人的库)。
 
 **Q：不想买服务器，能只用 GitHub + Cloudflare 吗？**
 能。Worker 就是为这个场景写的，见 [全托管部署](#全托管部署github--cloudflare-workers--pages)：

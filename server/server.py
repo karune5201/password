@@ -36,7 +36,7 @@ import time
 from collections import defaultdict, deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -82,14 +82,53 @@ class App:
         contrib_mode: str = "queue",
         contrib_max_pending: int = 500,
         pending_path: "str | None" = None,
+        dbs: "list[tuple[str, str]] | None" = None,
+        contrib_db: str = "community",
     ):
-        self.store = pwlib.Store(db_path)
+        # 多库：名字 -> Store。查询按顺序合并，靠前的优先。
+        if dbs:
+            self.dbs = [(name, pwlib.Store(path)) for name, path in dbs]
+        else:
+            self.dbs = [("main", pwlib.Store(db_path))]
+        if not self.dbs:
+            raise ValueError("至少需要一个数据库")
+
+        self.store = self.dbs[0][1]      # 兼容旧代码：默认主库
         self.token = token
         self.contrib_mode = contrib_mode
         self.contrib_max_pending = contrib_max_pending
-        # 待审队列与主库共用一个目录，文件名固定，便于备份
+        # 陌生人的投稿默认落到独立的 community 库
+        names = [n for n, _ in self.dbs]
+        self.contrib_db = contrib_db if contrib_db in names else names[-1]
+
         base_dir = os.path.dirname(self.store.path) or "."
         self.pending = pwlib.Store(pending_path or os.path.join(base_dir, "pending_uploads.json.gz"))
+
+    # ---- 多库读写 ----
+    def store_of(self, name: "str | None") -> pwlib.Store:
+        """按名字取库；name 为空时返回主库。"""
+        if not name:
+            return self.dbs[0][1]
+        for n, st in self.dbs:
+            if n == name:
+                return st
+        raise ValueError(f"没有名为 {name} 的库（可用: {', '.join(n for n, _ in self.dbs)}）")
+
+    def db_names(self) -> "list[str]":
+        return [n for n, _ in self.dbs]
+
+    def find(self, md5: str) -> "tuple[str, str] | None":
+        """在所有库里找，返回 (库名, 密码)。靠前的库优先。"""
+        key = pwlib.normalize_md5(md5)
+        for name, st in self.dbs:
+            pwd = st.load().get(key)
+            if pwd:
+                return name, pwd
+        return None
+
+    def find_any(self, md5: str) -> "str | None":
+        hit = self.find(md5)
+        return hit[1] if hit else None
 
     # ---- 鉴权 ----
     def auth_ok(self, header: "str | None", client_ip: str) -> bool:
@@ -102,9 +141,14 @@ class App:
         return client_ip in ("127.0.0.1", "::1", "localhost")
 
     # ---- 业务 ----
-    def query(self, md5: str) -> "str | None":
+    def query(self, md5: str, db: "str | None" = None) -> "dict | None":
+        """db 为空时跨库查找；指定则只查那个库。返回 {db, password}。"""
         try:
-            return self.store.get(md5)
+            if db:
+                pwd = self.store_of(db).get(md5)
+                return {"db": db, "password": pwd} if pwd else None
+            hit = self.find(md5)
+            return {"db": hit[0], "password": hit[1]} if hit else None
         except ValueError:
             raise
         except pwlib.DBError as exc:
@@ -125,10 +169,14 @@ class App:
         if len(password) > 512:
             return HTTPStatus.BAD_REQUEST, {"error": "密码过长"}
 
-        changed = self.store.put(md5, password)
+        try:
+            target = self.store_of(payload.get("db"))
+        except ValueError as exc:
+            return HTTPStatus.BAD_REQUEST, {"error": str(exc)}
+        changed = target.put(md5, password)
         return (
             HTTPStatus.CREATED if changed else HTTPStatus.OK,
-            {"status": "created" if changed else "exists", "md5": md5},
+            {"status": "created" if changed else "exists", "md5": md5, "db": payload.get("db") or self.db_names()[0]},
         )
 
     def bulk(self, payload: "dict") -> "tuple[int, dict]":
@@ -136,11 +184,21 @@ class App:
         if not isinstance(entries, dict):
             return HTTPStatus.BAD_REQUEST, {"error": "entries 必须是对象"}
         clean = {str(k): str(v) for k, v in entries.items() if isinstance(v, str) and v}
-        stats = self.store.merge(clean, overwrite=bool(payload.get("overwrite")))
+        try:
+            target = self.store_of(payload.get("db"))
+        except ValueError as exc:
+            return HTTPStatus.BAD_REQUEST, {"error": str(exc)}
+        stats = target.merge(clean, overwrite=bool(payload.get("overwrite")))
         return HTTPStatus.OK, {"ok": True, **stats}
 
-    def dump(self) -> dict:
-        return {"entries": self.store.load(), "stats": self.store.stats()}
+    def dump(self, db: "str | None" = None) -> dict:
+        store = self.store_of(db)
+        return {
+            "db": db or self.db_names()[0],
+            "dbs": [{"name": n, "entries": len(st.load())} for n, st in self.dbs],
+            "entries": store.load(),
+            "stats": store.stats(),
+        }
 
     # ---- 公开投稿：任何人都能提交，默认进审核队列 ----
     def contribute(self, payload: "dict", client_ip: str) -> "tuple[int, dict]":
@@ -162,9 +220,16 @@ class App:
         except ValueError as exc:
             return HTTPStatus.BAD_REQUEST, {"error": str(exc)}
 
-        # 已经有了：不重复收，直接告诉对方
+        # 想写进哪个库：默认 community（陌生人的投稿单独一个库）
         try:
-            if self.store.get(md5):
+            target_name = payload.get("db") or self.contrib_db
+            target = self.store_of(target_name)
+        except ValueError as exc:
+            return HTTPStatus.BAD_REQUEST, {"error": str(exc)}
+
+        # 任何一个库里已经有了：不重复收
+        try:
+            if self.find_any(md5):
                 return HTTPStatus.OK, {"status": "exists", "md5": md5}
         except pwlib.DBError as exc:
             return HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)}
@@ -177,8 +242,8 @@ class App:
             return HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)}
 
         if self.contrib_mode == "auto":
-            self.store.put(md5, password)
-            return HTTPStatus.CREATED, {"status": "accepted", "md5": md5}
+            target.put(md5, password)
+            return HTTPStatus.CREATED, {"status": "accepted", "md5": md5, "db": target_name}
 
         # 队列模式：容量上限，防止被刷爆磁盘
         pending_count = len(self.pending.load())
@@ -188,17 +253,34 @@ class App:
                 "pending": pending_count,
             }
 
-        self.pending.put(md5, password)
+        # pending 的值编码为 "库名\t密码"，这样审核时能知道该进哪个库
+        self.pending.put(md5, f"{target_name}\t{password}")
         return HTTPStatus.ACCEPTED, {
             "status": "pending",
             "md5": md5,
+            "db": target_name,
             "message": "已提交，等管理员审核后生效",
             "pending": pending_count + 1,
         }
 
+    @staticmethod
+    def _split_pending(raw: str) -> "tuple[str, str]":
+        """pending 值兼容两种格式："db\tpassword" 或老的纯密码。"""
+        if "\t" in raw:
+            db, _, pwd = raw.partition("\t")
+            return db, pwd
+        return "", raw
+
     def pending_view(self) -> dict:
-        entries = self.pending.load()
-        return {"count": len(entries), "entries": entries}
+        """返回 {md5: password} 便于人看，同时给出明细（含目标库）。"""
+        raw = self.pending.load()
+        entries = {}
+        detail = []
+        for md5, val in raw.items():
+            db, pwd = self._split_pending(val)
+            entries[md5] = pwd
+            detail.append({"md5": md5, "password": pwd, "db": db or self.contrib_db})
+        return {"count": len(raw), "entries": entries, "detail": detail}
 
     def review(self, payload: "dict", *, approve: bool) -> "tuple[int, dict]":
         """审核：approve=True 入库，False 丢弃。ids 支持列表或 all=true。"""
@@ -214,13 +296,20 @@ class App:
             targets = [str(i).strip().lower() for i in ids]
 
         done, skipped = [], []
+        by_db = {}
         for md5 in targets:
-            pwd = pending.get(md5)
-            if pwd is None:
+            val = pending.get(md5)
+            if val is None:
                 skipped.append(md5)
                 continue
+            db, pwd = self._split_pending(val)
             if approve:
-                self.store.put(md5, pwd)
+                try:
+                    target = self.store_of(db)
+                except ValueError:
+                    target = self.store_of(self.contrib_db)
+                target.put(md5, pwd)
+                by_db[target.path] = by_db.get(target.path, 0) + 1
             self.pending.delete(md5)
             done.append(md5)
 
@@ -230,6 +319,7 @@ class App:
             "done": done,
             "skipped": skipped,
             "pending": len(self.pending.load()),
+            "dbs": [{"name": n, "entries": len(st.load())} for n, st in self.dbs],
         }
 
 
@@ -311,17 +401,34 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             self._send(
                 HTTPStatus.OK,
-                {"status": "ok", "version": VERSION, "entries": len(self.app.store.load())},
+                {
+                    "status": "ok",
+                    "version": VERSION,
+                    "entries": sum(len(st.load()) for _, st in self.app.dbs),
+                    "dbs": [{"name": n, "entries": len(st.load())} for n, st in self.app.dbs],
+                },
             )
             return
         if path == "/stats":
-            self._send(HTTPStatus.OK, self.app.store.stats())
+            want_db = (parse_qs(urlparse(self.path).query).get("db") or [""])[0] or None
+            try:
+                store = self.app.store_of(want_db)
+            except ValueError as exc:
+                self._send(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            payload = store.stats()
+            payload["dbs"] = [{"name": n, "entries": len(st.load()), "path": st.path} for n, st in self.app.dbs]
+            self._send(HTTPStatus.OK, payload)
             return
         if path == "/db":
             if not self.app.auth_ok(self.headers.get("Authorization"), ip):
                 self._send(HTTPStatus.UNAUTHORIZED, {"error": "需要有效 token"})
                 return
-            self._send(HTTPStatus.OK, self.app.dump())
+            want_db = (parse_qs(urlparse(self.path).query).get("db") or [""])[0] or None
+            try:
+                self._send(HTTPStatus.OK, self.app.dump(want_db))
+            except ValueError as exc:
+                self._send(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
         if path == "/contrib/count":
             self._send(HTTPStatus.OK, {"pending": len(self.app.pending.load())})
@@ -332,20 +439,24 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(HTTPStatus.OK, self.app.pending_view())
             return
-        if path.startswith("/query/"):
-            raw = path[len("/query/") :]
+        if path.startswith("/query/") or path == "/query":
+            raw = path[len("/query/") :] if path.startswith("/query/") else (parse_qs(urlparse(self.path).query).get("md5") or [""])[0]
+            want_db = (parse_qs(urlparse(self.path).query).get("db") or [""])[0] or None
             try:
-                password = self.app.query(raw)
+                hit = self.app.query(raw, want_db)
             except ValueError as exc:
                 self._send(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
             except RuntimeError as exc:
                 self._send(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
                 return
-            if not password:
+            if not hit:
                 self._send(HTTPStatus.NOT_FOUND, {"error": "未找到该 MD5"})
                 return
-            self._send(HTTPStatus.OK, {"md5": raw.strip().lower(), "password": password})
+            self._send(
+                HTTPStatus.OK,
+                {"md5": raw.strip().lower(), "password": hit["password"], "db": hit["db"]},
+            )
             return
 
         self._send(HTTPStatus.NOT_FOUND, {"error": "未知接口"})
@@ -439,6 +550,23 @@ class FastBindHTTPServer(ThreadingHTTPServer):
         self.server_port = port
 
 
+def parse_dbs(spec: str) -> "list[tuple[str, str]]":
+    """解析 --dbs：'main=a.json.gz,community=b.json.gz'（也接受单一路径）。"""
+    if not spec:
+        return []
+    out = []
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" in item:
+            name, _, path = item.partition("=")
+            out.append((name.strip(), path.strip()))
+        else:
+            out.append(("main", item))
+    return out
+
+
 def make_server(
     bind: str,
     port: int,
@@ -447,9 +575,18 @@ def make_server(
     cors: str,
     contrib_mode: str = "queue",
     pending_path: "str | None" = None,
+    dbs: "list[tuple[str, str]] | None" = None,
+    contrib_db: str = "community",
 ) -> ThreadingHTTPServer:
     handler = type("BoundHandler", (Handler,), {})
-    handler.app = App(db, token, contrib_mode=contrib_mode, pending_path=pending_path)
+    handler.app = App(
+        db,
+        token,
+        contrib_mode=contrib_mode,
+        pending_path=pending_path,
+        dbs=dbs,
+        contrib_db=contrib_db,
+    )
     handler.limiter = RateLimiter()
     handler.cors_origin = cors
     return FastBindHTTPServer((bind, port), handler)
@@ -461,7 +598,17 @@ def main(argv: "list[str] | None" = None) -> int:
     )
     ap.add_argument("--bind", default="127.0.0.1", help="监听地址，默认 127.0.0.1（仅本机）")
     ap.add_argument("--port", type=int, default=5000)
-    ap.add_argument("--db", help="数据库路径")
+    ap.add_argument("--db", help="主数据库路径（单库模式）")
+    ap.add_argument(
+        "--dbs",
+        default=os.environ.get("PWDASH_DBS", ""),
+        help="多库配置：'main=passwords_local.json.gz,community=community.json.gz'；靠前的库优先",
+    )
+    ap.add_argument(
+        "--contrib-db",
+        default=os.environ.get("PWDASH_CONTRIB_DB", "community"),
+        help="陌生人投稿默认写入哪个库（默认 community，不存在则用最后一个库）",
+    )
     ap.add_argument("--cors", default="", help="允许的跨域来源，如 * 或 https://example.com")
     ap.add_argument(
         "--contrib-mode",
@@ -483,6 +630,15 @@ def main(argv: "list[str] | None" = None) -> int:
         print("❌ 监听非本机地址必须设置 PWDASH_TOKEN", file=sys.stderr)
         return 2
 
+    db_list = parse_dbs(args.dbs)
+    if not db_list and args.db:
+        # 单库时也给出约定：主库 + 同目录的 community 库（自动创建）
+        base_dir = os.path.dirname(os.path.abspath(args.db)) or "."
+        community = os.path.join(base_dir, "community_passwords.json.gz")
+        db_list = [("main", args.db)]
+        if os.path.basename(args.db) != os.path.basename(community):
+            db_list.append(("community", community))
+
     httpd = make_server(
         args.bind,
         args.port,
@@ -491,6 +647,8 @@ def main(argv: "list[str] | None" = None) -> int:
         args.cors,
         contrib_mode=args.contrib_mode,
         pending_path=args.pending,
+        dbs=db_list or None,
+        contrib_db=args.contrib_db,
     )
     store = pwlib.Store(args.db)
     print(f"🚀 pwdash {VERSION} 已启动 → http://{args.bind}:{args.port}", flush=True)

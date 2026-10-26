@@ -11,7 +11,10 @@ workers_dev = true
 GH_OWNER = "Karune-SHI-E"
 GH_REPO = "1111"
 GH_BRANCH = "master"
-GH_PATH = "passwords_local.json"
+GH_PATH = "passwords_local.json"            # 单库模式的路径（配了 GH_DBS 时以 GH_DBS 为准）
+# 多库：自己的库在前（优先），陌生人的投稿库在后，各自独立文件
+GH_DBS = "main=passwords_local.json,community=community_passwords.json"
+CONTRIB_DB = "community"                    # 陌生人投稿默认进哪个库
 CONTRIB_MODE = "queue"        # queue | auto | off
 CONTRIB_LIMIT = "10"          # 每 IP 每小时投稿上限
 CONTRIB_MAX_PENDING = "500"   # 待审队列上限

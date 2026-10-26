@@ -17,8 +17,8 @@
   const HISTORY_MAX = 12;
   const CACHE_TTL = 6 * 60 * 60 * 1000; // 6 小时
   const LS = {
-    db: 'pwdash.db.v2',
-    meta: 'pwdash.meta.v2',
+    db: 'pwdash.db.v3',
+    meta: 'pwdash.meta.v3',
     sources: 'pwdash.sources.v2',
     history: 'pwdash.history.v2',
     theme: 'pwdash.theme.v2',
@@ -29,10 +29,17 @@
   // 例：'https://pwdash.your-name.workers.dev'
   const DEFAULT_SERVER_URL = '';
 
+  // 多个库按顺序合并，靠前的优先。
+  // 想把自己的库和「陌生人投稿库」分开，就再加一条 community 的地址。
   const DEFAULT_SOURCES = [
     {
-      name: 'GitHub · Karune-SHI-E/1111',
+      name: '我的库',
       url: 'https://raw.githubusercontent.com/Karune-SHI-E/1111/master/passwords_local.json',
+      enabled: true,
+    },
+    {
+      name: '投稿库',
+      url: 'https://raw.githubusercontent.com/Karune-SHI-E/1111/master/community_passwords.json',
       enabled: true,
     },
   ];
@@ -41,7 +48,8 @@
   // 状态
   // ------------------------------------------------------------------
   const state = {
-    db: null, // { md5: password }
+    db: null, // { md5: password } —— 所有启用库合并后的结果
+    origin: null, // { md5: 来源库名 }
     meta: null, // { source, url, savedAt, count }
     sources: [],
     sourceStates: [],
@@ -177,46 +185,68 @@
     return state.sources.filter((s) => s.enabled);
   }
 
+  /**
+   * 拉取并**合并**所有启用数据源。
+   *
+   * 语义：列表靠前的库优先——同一个 MD5 出现在多个库里时，用靠前那个库的值。
+   * 这样可以把「自己的库」放第一位、「陌生人投稿库」放第二位，各库互不覆盖。
+   */
   async function refreshDb(opts) {
-    const force = Boolean(opts && opts.force);
     const list = activeSources();
     if (!list.length) throw new Error('没有启用任何数据源');
 
     state.sourceStates = list.map((s) => ({ name: s.name, url: s.url, status: 'wait', detail: '' }));
     renderSources();
 
+    const merged = {};      // md5 -> password
+    const origin = {};      // md5 -> 来源库名称
+    const perSource = [];   // 每个库的统计
     let lastErr = null;
+    let okCount = 0;
+
     for (let i = 0; i < list.length; i++) {
       const src = list[i];
       state.sourceStates[i].status = 'loading';
       renderSources();
       try {
         const entries = normalizeDb(await fetchJson(src.url));
-        const count = Object.keys(entries).length;
-        if (!count) throw new Error('库内容为空');
-
-        state.db = entries;
-        state.meta = { source: src.name, url: src.url, savedAt: Date.now(), count };
+        let added = 0;
+        for (const [md5, pwd] of Object.entries(entries)) {
+          if (md5 in merged) continue; // 前面的库优先
+          merged[md5] = pwd;
+          origin[md5] = src.name;
+          added++;
+        }
+        okCount++;
         state.sourceStates[i].status = 'ok';
-        state.sourceStates[i].detail = `${count} 条`;
+        state.sourceStates[i].detail = `${added} 条` + (added < Object.keys(entries).length ? `（另 ${Object.keys(entries).length - added} 条已被高优先级库覆盖）` : '');
+        perSource.push({ name: src.name, url: src.url, count: Object.keys(entries).length, added });
         renderSources();
-
-        const cached = lsSet(LS.db, entries) && lsSet(LS.meta, state.meta);
-        if (!cached) toast('密码库已加载，但本地缓存失败（存储空间不足）', 'err');
-        renderMeta();
-        return state.db;
       } catch (err) {
         state.sourceStates[i].status = 'err';
         state.sourceStates[i].detail = String((err && err.message) || err);
+        perSource.push({ name: src.name, url: src.url, count: 0, added: 0, error: String((err && err.message) || err) });
         renderSources();
         lastErr = err;
       }
     }
-    if (state.db) {
-      renderMeta('（已回退到本地缓存）');
-      return state.db;
+
+    if (!okCount) {
+      if (state.db) {
+        renderMeta('（已回退到本地缓存）');
+        return state.db;
+      }
+      throw lastErr || new Error('所有数据源都不可用');
     }
-    throw lastErr || new Error('所有数据源都不可用');
+
+    state.db = merged;
+    state.origin = origin;
+    state.meta = { sources: perSource, savedAt: Date.now(), count: Object.keys(merged).length };
+
+    const cached = lsSet(LS.db, merged) && lsSet(LS.meta, state.meta);
+    if (!cached) toast('密码库已加载，但本地缓存失败（存储空间不足）', 'err');
+    renderMeta();
+    return state.db;
   }
 
   async function ensureDb() {
@@ -237,10 +267,11 @@
     if (!Object.keys(db).length) return false;
     state.db = db;
     state.meta = lsGet(LS.meta, null) || {
-      source: '本地缓存',
+      sources: [{ name: '本地缓存', url: '', count: Object.keys(db).length, added: Object.keys(db).length }],
       savedAt: 0,
       count: Object.keys(db).length,
     };
+    state.origin = {};
     return true;
   }
 
@@ -282,7 +313,10 @@
 
   async function lookup(md5) {
     await ensureDb();
-    if (state.db && state.db[md5]) return { pwd: state.db[md5], from: state.meta ? state.meta.source : '本地库' };
+    if (state.db && state.db[md5]) {
+      const from = (state.origin && state.origin[md5]) || '本地缓存';
+      return { pwd: state.db[md5], from };
+    }
     const remote = await lookupRemote(md5);
     if (remote) return { pwd: remote, from: '私有服务端' };
     return { pwd: '', from: '' };
@@ -396,18 +430,20 @@
       return;
     }
     list.replaceChildren(
-      ...state.sourceStates.map((s) => {
+      ...state.sourceStates.map((s, i) => {
         const mark =
           s.status === 'ok'
             ? el('span', { class: 'ok', text: '✓' })
             : s.status === 'err'
             ? el('span', { class: 'err', text: '✕' })
             : el('span', { class: 'wait', text: '…' });
+        const tag = i === 0 ? '优先' : `第 ${i + 1} 库`;
         return el(
           'li',
           { title: s.url },
           mark,
           el('span', { class: 'name', text: s.name }),
+          el('span', { class: 'chip-mini', text: tag }),
           el('span', { class: 'detail', text: s.detail || (s.status === 'loading' ? '加载中' : '') })
         );
       })
@@ -421,8 +457,11 @@
       return;
     }
     const count = Object.keys(state.db || {}).length;
+    const libs = Array.isArray(meta.sources) ? meta.sources : [];
+    const okLibs = libs.filter((l) => !l.error);
+    const libText = okLibs.length > 1 ? `${okLibs.length} 个库合并` : okLibs[0] ? okLibs[0].name : '本地缓存';
     $('db-meta').textContent =
-      `${count} 条记录 · 来自 ${meta.source} · 更新于 ${timeAgo(meta.savedAt)}${suffix || ''}`;
+      `${count} 条记录 · ${libText} · 更新于 ${timeAgo(meta.savedAt)}${suffix || ''}`;
     renderCacheInfo();
   }
 
@@ -435,7 +474,8 @@
       return;
     }
     const bytes = new Blob([JSON.stringify(cached)]).size;
-    info.textContent = `已缓存 ${Object.keys(cached).length} 条（约 ${formatBytes(bytes)}），${cacheIsFresh() ? '仍在有效期内' : '已过期，下次打开会尝试刷新'}。离线也能查询。`;
+    const libs = (state.meta && Array.isArray(state.meta.sources) ? state.meta.sources : []).filter((l) => !l.error).length;
+    info.textContent = `已缓存 ${Object.keys(cached).length} 条${libs > 1 ? `（${libs} 个库合并）` : ''}，约 ${formatBytes(bytes)}，${cacheIsFresh() ? '仍在有效期内' : '已过期，下次打开会尝试刷新'}。离线也能查询。`;
   }
 
   function pushHistory(md5, pwd) {
@@ -850,58 +890,6 @@
   }
 
   // ------------------------------------------------------------------
-  // 导入 / 导出
-  // ------------------------------------------------------------------
-  async function readDbFile(file) {
-    const lower = file.name.toLowerCase();
-    if (lower.endsWith('.gz')) {
-      if (typeof DecompressionStream !== 'function') throw new Error('浏览器不支持就地解压 .gz，请先转成 .json');
-      const ds = new DecompressionStream('deflate'); // 库文件是 zlib 格式
-      const stream = file.stream().pipeThrough(ds);
-      return await new Response(stream).json();
-    }
-    return JSON.parse(await file.text());
-  }
-
-  async function importDb(file) {
-    if (!file) return;
-    try {
-      const raw = await readDbFile(file);
-      const entries = normalizeDb(raw);
-      const count = Object.keys(entries).length;
-      if (!count) throw new Error('文件里没有可用的记录');
-      state.db = Object.assign({}, state.db || {}, entries);
-      state.meta = {
-        source: `本地导入（${file.name}）`,
-        savedAt: Date.now(),
-        count: Object.keys(state.db).length,
-      };
-      lsSet(LS.db, state.db);
-      lsSet(LS.meta, state.meta);
-      renderMeta();
-      renderCacheInfo();
-      toast(`已导入 ${count} 条记录`);
-    } catch (err) {
-      toast('导入失败：' + ((err && err.message) || err), 'err');
-    }
-  }
-
-  function exportDb() {
-    if (!state.db || !Object.keys(state.db).length) {
-      toast('库里没有数据可导出', 'err');
-      return;
-    }
-    const blob = new Blob([JSON.stringify(state.db, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = el('a', { href: url, download: 'passwords_local.json' });
-    document.body.append(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-    toast('已导出当前库');
-  }
-
-  // ------------------------------------------------------------------
   // 离线 / 联网状态
   // ------------------------------------------------------------------
   function updateNetBadge() {
@@ -1081,14 +1069,7 @@
     $('server-url').addEventListener('change', saveServer);
     $('server-token').addEventListener('change', saveServer);
 
-    // 导入 / 导出 / 清缓存
-    $('btn-import').addEventListener('click', () => $('import-input').click());
-    $('import-input').addEventListener('change', (e) => {
-      const file = e.target.files && e.target.files[0];
-      importDb(file);
-      e.target.value = '';
-    });
-    $('btn-export').addEventListener('click', exportDb);
+    // 清缓存
     $('btn-clear-cache').addEventListener('click', () => {
       lsDel(LS.db);
       lsDel(LS.meta);

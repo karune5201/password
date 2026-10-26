@@ -139,6 +139,8 @@
     <section class="dialog-section">
       <h3>数据源</h3>
       <p class="hint">按顺序尝试，第一个命中的结果胜出。可增删、上下调整优先级。</p>
+      <p class="hint">多个库按顺序合并：<b>靠前的库优先</b>，同一个 MD5 出现在两个库里时用靠前那个。
+        常见做法是「自己的库」放第一条，「陌生人投稿库」放第二条，两者互不污染。</p>
       <ul class="source-edit" id="source-edit"></ul>
       <div class="row tight">
         <input id="new-source-name" type="text" placeholder="名称，如 我的镜像">
@@ -160,11 +162,9 @@
       <h3>本地与离线</h3>
       <p class="hint" id="cache-info">—</p>
       <div class="row tight">
-        <button class="btn ghost" id="btn-import" type="button">导入本地库</button>
-        <button class="btn ghost" id="btn-export" type="button">导出当前库</button>
-        <button class="btn danger" id="btn-clear-cache" type="button">清除缓存</button>
-        <input type="file" id="import-input" accept=".json,.gz,application/json" hidden>
+        <button class="btn danger" id="btn-clear-cache" type="button">清除本地缓存</button>
       </div>
+      <p class="hint">密码库会自动缓存在本机，断网也能查。公共电脑用完建议清一次。</p>
     </section>
 
     <div class="row end">
