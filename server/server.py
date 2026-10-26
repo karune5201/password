@@ -631,18 +631,19 @@ def main(argv: "list[str] | None" = None) -> int:
         return 2
 
     db_list = parse_dbs(args.dbs)
-    if not db_list and args.db:
+    primary = args.db or pwlib.default_db_path()
+    if not db_list:
         # 单库时也给出约定：主库 + 同目录的 community 库（自动创建）
-        base_dir = os.path.dirname(os.path.abspath(args.db)) or "."
+        base_dir = os.path.dirname(os.path.abspath(primary)) or "."
         community = os.path.join(base_dir, "community_passwords.json.gz")
-        db_list = [("main", args.db)]
-        if os.path.basename(args.db) != os.path.basename(community):
+        db_list = [("main", primary)]
+        if os.path.basename(primary) != os.path.basename(community):
             db_list.append(("community", community))
 
     httpd = make_server(
         args.bind,
         args.port,
-        args.db,
+        primary,
         token,
         args.cors,
         contrib_mode=args.contrib_mode,

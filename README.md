@@ -272,6 +272,7 @@ python3 server/server.py --bind 0.0.0.0 --port 5000 \
   --contrib-db public
 ```
 
+- 不给 `--db` 时用默认库（`PWDASH_DB` 或项目根目录的 `passwords_local.json.gz`），社区库按同目录约定自动挂上
 - `--dbs`：多库配置，等价环境变量 `PWDASH_DBS`
 - `--contrib-db`：陌生人投稿默认写进哪个库，等价 `PWDASH_CONTRIB_DB`
 - 查询可指定库：`GET /query/<md5>?db=community`，不指定就跨库查找
